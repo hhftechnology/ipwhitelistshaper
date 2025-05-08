@@ -48,9 +48,9 @@ type StoredState struct {
 
 // IPData stores information about whitelisted IPs
 type IPData struct {
-	ExpiresAt    time.Time `json:"expiresAt"`
-	ValidationID string    `json:"validationId"`
-	ValidationCode string    `json:"validationCode"` // New field
+	ExpiresAt       time.Time `json:"expiresAt"`
+	ValidationID    string    `json:"validationId"`
+	ValidationCode  string    `json:"validationCode"`
 }
 
 // CreateConfig creates a default plugin configuration.
@@ -241,13 +241,18 @@ func (i *IPWhitelistShaper) handleKnockRequest(rw http.ResponseWriter, req *http
 
 	// Set expiration time
 	expiration := time.Now().Add(time.Duration(i.config.ExpirationTime) * time.Second)
-    fmt.Printf("DEBUG: Storing token %s for IP %s\n", token, clientIP) // Add debugging
-	// Store pending approval
+    
+    fmt.Printf("DEBUG: Storing token %s with validation code %s for IP %s\n", token, validationCode, clientIP)
+    
+	// Store pending approval - FIX: Store the validation code!
 	i.pendingApprovals[clientIP] = IPData{
-		ExpiresAt:    expiration,
-		ValidationID: token,
+		ExpiresAt:      expiration,
+		ValidationID:   token,
+		ValidationCode: validationCode,  // This was missing in the original code
 	}
+    
     fmt.Printf("DEBUG: Current pending approvals: %+v\n", i.pendingApprovals)
+    
 	// Save state after modifying it
 	if i.config.StorageEnabled {
 		go i.saveState()
@@ -321,37 +326,49 @@ func (i *IPWhitelistShaper) handleKnockRequest(rw http.ResponseWriter, req *http
 
 // handleApproveRequest processes approval requests
 func (i *IPWhitelistShaper) handleApproveRequest(rw http.ResponseWriter, req *http.Request) {
-	rawIP := req.URL.Query().Get("ip")
-	rawToken := req.URL.Query().Get("token")
-	fmt.Printf("DEBUG: Received approval request for IP: %s, Token: %s\n", rawIP, rawToken)
+    // FIXED: Removed duplicate code retrieval (rawIP and rawToken)
+    fmt.Printf("DEBUG: Received approval request with URL: %s\n", req.URL.String())
+    
     // Get encoded parameters from URL
     ipEncoded := req.URL.Query().Get("ip")
     tokenEncoded := req.URL.Query().Get("token")
     validationCodeEncoded := req.URL.Query().Get("validationCode") 
     expirationStr := req.URL.Query().Get("expiration")
 
-    // Decode URL parameters
+    // Decode URL parameters with improved error handling
     ip, err1 := url.QueryUnescape(ipEncoded)
     token, err2 := url.QueryUnescape(tokenEncoded)
     validationCode, err3 := url.QueryUnescape(validationCodeEncoded)
 
-    // Handle decoding errors (optional but recommended)
-    if err1 != nil || err2 != nil || err3 != nil {
+    // Handle decoding errors with better error reporting
+    if err1 != nil {
+        fmt.Printf("ERROR: Failed to decode IP parameter: %v\n", err1)
         rw.WriteHeader(http.StatusBadRequest)
-        rw.Write([]byte("Error decoding URL parameters"))
+        rw.Write([]byte("Error decoding IP parameter"))
+        return
+    }
+    if err2 != nil {
+        fmt.Printf("ERROR: Failed to decode token parameter: %v\n", err2)
+        rw.WriteHeader(http.StatusBadRequest)
+        rw.Write([]byte("Error decoding token parameter"))
+        return
+    }
+    if err3 != nil {
+        fmt.Printf("ERROR: Failed to decode validation code parameter: %v\n", err3)
+        rw.WriteHeader(http.StatusBadRequest)
+        rw.Write([]byte("Error decoding validation code parameter"))
         return
     }
 
     // Validate parameters
     if ip == "" || token == "" {
+        fmt.Printf("ERROR: Missing required parameters. IP: '%s', Token: '%s'\n", ip, token)
         rw.WriteHeader(http.StatusBadRequest)
-        rw.Write([]byte("Invalid request parameters"))
+        rw.Write([]byte("Invalid request parameters - missing IP or token"))
         return
     }
 
-    // For validationCode - either use it for validation or use the blank identifier
-    // Option 1: Use it for validation
-    // The rest of your function using the decoded variables...
+    fmt.Printf("DEBUG: Processing approval for IP: %s, Token: %s, ValidationCode: %s\n", ip, token, validationCode)
     
     // Lock for modifications
     i.mutex.Lock()
@@ -359,15 +376,23 @@ func (i *IPWhitelistShaper) handleApproveRequest(rw http.ResponseWriter, req *ht
 
     // Check if IP and token match
     pendingData, exists := i.pendingApprovals[ip]
-    if !exists || pendingData.ValidationID != token {
+    if !exists {
+        fmt.Printf("ERROR: No pending approval found for IP: %s\n", ip)
         rw.WriteHeader(http.StatusForbidden)
-        rw.Write([]byte("Invalid token or IP address"))
+        rw.Write([]byte("Invalid token or IP address: No pending approval found"))
+        return
+    }
+    
+    if pendingData.ValidationID != token {
+        fmt.Printf("ERROR: Token mismatch. Expected: '%s', Got: '%s'\n", pendingData.ValidationID, token)
+        rw.WriteHeader(http.StatusForbidden)
+        rw.Write([]byte("Invalid token or IP address: Token mismatch"))
         return
     }
 
-    // Optional: Validate the validation code if needed
-    // If ValidationCode is stored in your IPData struct
-    if pendingData.ValidationCode != validationCode {
+    // Validate the validation code if provided
+    if validationCode != "" && pendingData.ValidationCode != validationCode {
+        fmt.Printf("ERROR: Validation code mismatch. Expected: '%s', Got: '%s'\n", pendingData.ValidationCode, validationCode)
         rw.WriteHeader(http.StatusForbidden)
         rw.Write([]byte("Invalid validation code"))
         return
@@ -384,8 +409,9 @@ func (i *IPWhitelistShaper) handleApproveRequest(rw http.ResponseWriter, req *ht
 
 	// Add IP to whitelist
 	i.whitelistedIPs[ip] = IPData{
-		ExpiresAt:    time.Now().Add(time.Duration(expirationTime) * time.Second),
-		ValidationID: token,
+		ExpiresAt:      time.Now().Add(time.Duration(expirationTime) * time.Second),
+		ValidationID:   token,
+		ValidationCode: pendingData.ValidationCode, // Preserve the validation code
 	}
 
 	// Remove from pending approvals
@@ -396,6 +422,8 @@ func (i *IPWhitelistShaper) handleApproveRequest(rw http.ResponseWriter, req *ht
 		go i.saveState()
 	}
 
+    fmt.Printf("DEBUG: Successfully approved IP: %s, expiration: %d seconds\n", ip, expirationTime)
+    
 	// Send notification
 	message := fmt.Sprintf("✅ Whitelisted %s for %d seconds", ip, expirationTime)
 	i.sendNotification(message)
@@ -607,7 +635,7 @@ func (i *IPWhitelistShaper) generateToken(ip string) string {
 	h := hmac.New(sha256.New, []byte(i.config.SecretKey))
 	data := ip + fmt.Sprintf("%d", time.Now().Unix())
 	h.Write([]byte(data))
-	return hex.EncodeToString(h.Sum(nil))
+	return hex.EncodeToString(h.Sum(nil)[:16])
 }
 
 // getRandomWord returns a random word for validation
