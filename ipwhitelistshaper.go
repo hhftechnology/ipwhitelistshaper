@@ -14,6 +14,10 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"bytes"
+	"encoding/json"
+	"io/ioutil"
+
 )
 
 // Config defines the plugin configuration.
@@ -330,24 +334,50 @@ func (i *IPWhitelistShaper) getRandomWord() string {
 
 // sendNotification sends a notification message to the configured URL
 func (i *IPWhitelistShaper) sendNotification(message string) {
-	// Skip if no notification URL is configured
-	if i.config.NotificationURL == "" {
-		return
-	}
+    // Skip if no notification URL is configured
+    if i.config.NotificationURL == "" {
+        return
+    }
 
-	// Make an HTTP POST request to the notification URL
-	// This is a simplified implementation - in a real plugin you might want to
-	// use a more sophisticated mechanism or external webhook service
-	go func() {
-		values := url.Values{}
-		values.Set("message", message)
-
-		_, err := http.PostForm(i.config.NotificationURL, values)
-		if err != nil {
-			// In a real plugin, you'd want to log this error
-			fmt.Printf("Error sending notification: %v\n", err)
-		}
-	}()
+    // Make an HTTP POST request to the notification URL
+    go func() {
+        // For Discord webhooks, we need to send JSON
+        payload := map[string]string{
+            "content": message,
+        }
+        
+        jsonData, err := json.Marshal(payload)
+        if err != nil {
+            fmt.Printf("Error creating JSON payload: %v\n", err)
+            return
+        }
+        
+        // Create a POST request with JSON content type
+        req, err := http.NewRequest("POST", i.config.NotificationURL, bytes.NewBuffer(jsonData))
+        if err != nil {
+            fmt.Printf("Error creating request: %v\n", err)
+            return
+        }
+        
+        req.Header.Set("Content-Type", "application/json")
+        
+        // Add a timeout to the client
+        client := &http.Client{
+            Timeout: 10 * time.Second,
+        }
+        
+        resp, err := client.Do(req)
+        if err != nil {
+            fmt.Printf("Error sending Discord notification: %v\n", err)
+            return
+        }
+        defer resp.Body.Close()
+        
+        if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+            body, _ := ioutil.ReadAll(resp.Body)
+            fmt.Printf("Discord webhook error (Status %d): %s\n", resp.StatusCode, string(body))
+        }
+    }()
 }
 
 // getClientIP extracts the client IP based on the chosen strategy
