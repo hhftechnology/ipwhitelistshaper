@@ -1,270 +1,147 @@
-This repository includes an example plugin, `demo`, for you to use as a reference for developing your own plugins.
+# Traefik IP Whitelist Shaper
 
-[![Build Status](https://github.com/traefik/plugindemo/workflows/Main/badge.svg?branch=master)](https://github.com/traefik/plugindemo/actions)
+<div align="center" width="100%">
+    <p>A Traefik middleware plugin for dynamic IP whitelisting with administrator approval flow</p>
+    <a target="_blank" href="https://github.com/hhftechnology/ipwhitelistshaper"><img src="https://img.shields.io/badge/maintainer-hhftechnology-orange" /></a>
+</div>
 
-The existing plugins can be browsed into the [Plugin Catalog](https://plugins.traefik.io).
+## How It Works
 
-# Developing a Traefik plugin
+This Traefik plugin provides a dynamic IP whitelisting mechanism with an admin approval flow. When a user tries to access a protected service and is not in the whitelist, they can request temporary access through a special endpoint. An administrator receives a notification with an approval link that can whitelist the user's IP for a configurable amount of time.
 
-[Traefik](https://traefik.io) plugins are developed using the [Go language](https://golang.org).
+The flow works as follows:
 
-A [Traefik](https://traefik.io) middleware plugin is just a [Go package](https://golang.org/ref/spec#Packages) that provides an `http.Handler` to perform specific processing of requests and responses.
+1. User tries to access a protected service → gets 403 Forbidden response
+2. User visits the knock-knock endpoint (e.g., `/knock-knock`) to request access
+3. Admin receives a notification with the user's IP, a random validation code, and an approval link
+4. Admin verifies the user (using the validation code) and clicks the approval link
+5. User's IP is whitelisted for a limited time period
+6. After the time period expires, the IP is automatically removed from the whitelist
 
-Rather than being pre-compiled and linked, however, plugins are executed on the fly by [Yaegi](https://github.com/traefik/yaegi), an embedded Go interpreter.
+## Configuration
 
-## Usage
+### Static Configuration
 
-For a plugin to be active for a given Traefik instance, it must be declared in the static configuration.
-
-Plugins are parsed and loaded exclusively during startup, which allows Traefik to check the integrity of the code and catch errors early on.
-If an error occurs during loading, the plugin is disabled.
-
-For security reasons, it is not possible to start a new plugin or modify an existing one while Traefik is running.
-
-Once loaded, middleware plugins behave exactly like statically compiled middlewares.
-Their instantiation and behavior are driven by the dynamic configuration.
-
-Plugin dependencies must be [vendored](https://golang.org/ref/mod#vendoring) for each plugin.
-Vendored packages should be included in the plugin's GitHub repository. ([Go modules](https://blog.golang.org/using-go-modules) are not supported.)
-
-### Configuration
-
-For each plugin, the Traefik static configuration must define the module name (as is usual for Go packages).
-
-The following declaration (given here in YAML) defines a plugin:
+Enable the plugin in your Traefik static configuration:
 
 ```yaml
 # Static configuration
-
 experimental:
   plugins:
-    example:
-      moduleName: github.com/traefik/plugindemo
-      version: v0.2.1
+    ipwhitelistshaper:
+      moduleName: github.com/hhftechnology/ipwhitelistshaper
+      version: v0.1.0
 ```
 
-Here is an example of a file provider dynamic configuration (given here in YAML), where the interesting part is the `http.middlewares` section:
+### Dynamic Configuration
+
+Configure the middleware in your dynamic configuration:
 
 ```yaml
 # Dynamic configuration
+http:
+  middlewares:
+    my-ipwhitelistshaper:
+      plugin:
+        ipwhitelistshaper:
+          # Default endpoint for requesting access
+          knockEndpoint: "/knock-knock"
+          
+          # Allow private networks by default (10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16)
+          defaultPrivateClassSources: true
+          
+          # Configure how long (in seconds) an approved IP should remain in the whitelist
+          expirationTime: 300
+          
+          # Depth to look into X-Forwarded-For header (set to 1 if behind CloudFlare or another proxy)
+          ipStrategyDepth: 0
+          
+          # IPs to exclude from X-Forwarded-For processing (comma-separated)
+          excludedIPs: []
+          
+          # Permanently whitelisted IPs (in addition to defaults)
+          whitelistedIPs: []
+          
+          # Secret key for secure token generation (auto-generated if not provided)
+          secretKey: ""
+          
+          # URL for notifications (HTTP POST will be made with "message" parameter)
+          notificationURL: "https://yourwebhook.example.com/notify"
+          
+          # Base URL for approval links (defaults to the request host if not specified)
+          approvalURL: "https://traefik.example.com"
+```
 
+## Example Router Configuration
+
+Apply the middleware to your HTTP routers to protect your services:
+
+```yaml
 http:
   routers:
-    my-router:
-      rule: host(`demo.localhost`)
-      service: service-foo
-      entryPoints:
-        - web
+    protected-service:
+      rule: "Host(`service.example.com`)"
+      service: "my-service"
       middlewares:
-        - my-plugin
-
-  services:
-   service-foo:
-      loadBalancer:
-        servers:
-          - url: http://127.0.0.1:5000
-  
-  middlewares:
-    my-plugin:
-      plugin:
-        example:
-          headers:
-            Foo: Bar
-```
-
-### Local Mode
-
-Traefik also offers a developer mode that can be used for temporary testing of plugins not hosted on GitHub.
-To use a plugin in local mode, the Traefik static configuration must define the module name (as is usual for Go packages) and a path to a [Go workspace](https://golang.org/doc/gopath_code.html#Workspaces), which can be the local GOPATH or any directory.
-
-The plugins must be placed in `./plugins-local` directory,
-which should be in the working directory of the process running the Traefik binary.
-The source code of the plugin should be organized as follows:
-
-```
-./plugins-local/
-    └── src
-        └── github.com
-            └── traefik
-                └── plugindemo
-                    ├── demo.go
-                    ├── demo_test.go
-                    ├── go.mod
-                    ├── LICENSE
-                    ├── Makefile
-                    └── readme.md
-```
-
-```yaml
-# Static configuration
-
-experimental:
-  localPlugins:
-    example:
-      moduleName: github.com/traefik/plugindemo
-```
-
-(In the above example, the `plugindemo` plugin will be loaded from the path `./plugins-local/src/github.com/traefik/plugindemo`.)
-
-```yaml
-# Dynamic configuration
-
-http:
-  routers:
-    my-router:
-      rule: host(`demo.localhost`)
-      service: service-foo
-      entryPoints:
-        - web
+        - "my-ipwhitelistshaper"
+    
+    # Special router to handle the knock-knock endpoint
+    knock-endpoint:
+      rule: "Host(`service.example.com`) && Path(`/knock-knock`)"
+      service: "my-service"
       middlewares:
-        - my-plugin
-
-  services:
-   service-foo:
-      loadBalancer:
-        servers:
-          - url: http://127.0.0.1:5000
-  
-  middlewares:
-    my-plugin:
-      plugin:
-        example:
-          headers:
-            Foo: Bar
+        - "my-ipwhitelistshaper"
 ```
 
-## Defining a Plugin
+## Notifications
 
-A plugin package must define the following exported Go objects:
+The plugin sends two types of notifications:
 
-- A type `type Config struct { ... }`. The struct fields are arbitrary.
-- A function `func CreateConfig() *Config`.
-- A function `func New(ctx context.Context, next http.Handler, config *Config, name string) (http.Handler, error)`.
+1. **Access Request Notifications**: When a user visits the knock-knock endpoint, a notification is sent with their IP, a validation code, and an approval link.
+2. **Status Notifications**: When an IP is approved or expires.
 
-```go
-// Package example a example plugin.
-package example
+You can configure a notification URL to receive these updates. The plugin will make HTTP POST requests to this URL with a "message" parameter containing the notification text.
 
-import (
-	"context"
-	"net/http"
-)
+For more sophisticated notifications, you can set up a webhook receiver that forwards these messages to your preferred notification channel (Slack, Telegram, email, etc.).
 
-// Config the plugin configuration.
-type Config struct {
-	// ...
-}
+## Comparison with Original TraefikShaper
 
-// CreateConfig creates the default plugin configuration.
-func CreateConfig() *Config {
-	return &Config{
-		// ...
-	}
-}
+This plugin is based on the original [TraefikShaper](https://github.com/l4rm4nd/TraefikShaper) project, but has been redesigned as a native Traefik plugin. Key differences:
 
-// Example a plugin.
-type Example struct {
-	next     http.Handler
-	name     string
-	// ...
-}
+1. **Native Integration**: Runs directly within Traefik instead of requiring a separate container
+2. **Language**: Written in Go instead of Python
+3. **Storage**: Uses in-memory data structures instead of manipulating config files
+4. **Notifications**: Simplified notification system through webhooks
 
-// New created a new plugin.
-func New(ctx context.Context, next http.Handler, config *Config, name string) (http.Handler, error) {
-	// ...
-	return &Example{
-		// ...
-	}, nil
-}
+## Usage Behind a Proxy (like CloudFlare)
 
-func (e *Example) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
-	// ...
-	e.next.ServeHTTP(rw, req)
-}
-```
-
-## Logs
-
-Currently, the only way to send logs to Traefik is to use `os.Stdout.WriteString("...")` or `os.Stderr.WriteString("...")`.
-
-In the future, we will try to provide something better and based on levels.
-
-## Plugins Catalog
-
-Traefik plugins are stored and hosted as public GitHub repositories.
-
-Every 30 minutes, the Plugins Catalog online service polls Github to find plugins and add them to its catalog.
-
-### Prerequisites
-
-To be recognized by Plugins Catalog, your repository must meet the following criteria:
-
-- The `traefik-plugin` topic must be set.
-- The `.traefik.yml` manifest must exist, and be filled with valid contents.
-
-If your repository fails to meet either of these prerequisites, Plugins Catalog will not see it.
-
-### Manifest
-
-A manifest is also mandatory, and it should be named `.traefik.yml` and stored at the root of your project.
-
-This YAML file provides Plugins Catalog with information about your plugin, such as a description, a full name, and so on.
-
-Here is an example of a typical `.traefik.yml`file:
+If your Traefik instance runs behind another proxy (like CloudFlare), you'll need to adjust the IP strategy to correctly identify client IPs:
 
 ```yaml
-# The name of your plugin as displayed in the Plugins Catalog web UI.
-displayName: Name of your plugin
-
-# For now, `middleware` is the only type available.
-type: middleware
-
-# The import path of your plugin.
-import: github.com/username/my-plugin
-
-# A brief description of what your plugin is doing.
-summary: Description of what my plugin is doing
-
-# Medias associated to the plugin (optional)
-iconPath: foo/icon.png
-bannerPath: foo/banner.png
-
-# Configuration data for your plugin.
-# This is mandatory,
-# and Plugins Catalog will try to execute the plugin with the data you provide as part of its startup validity tests.
-testData:
-  Headers:
-    Foo: Bar
+ipwhitelistshaper:
+  # Use depth 1 to get the client IP from X-Forwarded-For when behind one proxy
+  ipStrategyDepth: 1
 ```
 
-Properties include:
+Or alternatively, use the excludedIPs strategy:
 
-- `displayName` (required): The name of your plugin as displayed in the Plugins Catalog web UI.
-- `type` (required): For now, `middleware` is the only type available.
-- `import` (required): The import path of your plugin.
-- `summary` (required): A brief description of what your plugin is doing.
-- `testData` (required): Configuration data for your plugin. This is mandatory, and Plugins Catalog will try to execute the plugin with the data you provide as part of its startup validity tests.
-- `iconPath` (optional): A local path in the repository to the icon of the project.
-- `bannerPath` (optional): A local path in the repository to the image that will be used when you will share your plugin page in social medias.
+```yaml
+ipwhitelistshaper:
+  # Exclude CloudFlare IPs from X-Forwarded-For processing
+  excludedIPs:
+    - "103.21.244.0/22"
+    - "103.22.200.0/22"
+    # Add more CloudFlare IP ranges
+```
 
-There should also be a `go.mod` file at the root of your project. Plugins Catalog will use this file to validate the name of the project.
+## Building and Testing
 
-### Tags and Dependencies
+This plugin can be tested locally using the Traefik plugin local mode:
 
-Plugins Catalog gets your sources from a Go module proxy, so your plugins need to be versioned with a git tag.
+1. Clone this repository
+2. Place it in the `./plugins-local/src/github.com/hhftechnology/ipwhitelistshaper` directory
+3. Enable local plugins in your Traefik configuration
 
-Last but not least, if your plugin middleware has Go package dependencies, you need to vendor them and add them to your GitHub repository.
+## License
 
-If something goes wrong with the integration of your plugin, Plugins Catalog will create an issue inside your Github repository and will stop trying to add your repo until you close the issue.
-
-## Troubleshooting
-
-If Plugins Catalog fails to recognize your plugin, you will need to make one or more changes to your GitHub repository.
-
-In order for your plugin to be successfully imported by Plugins Catalog, consult this checklist:
-
-- The `traefik-plugin` topic must be set on your repository.
-- There must be a `.traefik.yml` file at the root of your project describing your plugin, and it must have a valid `testData` property for testing purposes.
-- There must be a valid `go.mod` file at the root of your project.
-- Your plugin must be versioned with a git tag.
-- If you have package dependencies, they must be vendored and added to your GitHub repository.
+MIT License

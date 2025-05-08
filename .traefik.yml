@@ -1,12 +1,9 @@
-displayName: Demo Plugin
+displayName: IP Whitelist Shaper
 type: middleware
-iconPath: .assets/icon.png
-
-import: github.com/traefik/plugindemo
-
-summary: '[Demo] Add Request Header'
+import: github.com/yourusername/ipwhitelistshaper
+summary: Dynamic IP whitelist manager with approval flow for Traefik
 
 testData:
-  Headers:
-    X-Demo: test
-    X-URL: '{{URL}}'
+  knockEndpoint: "/knock-knock"
+  defaultPrivateClassSources: true
+  expirationTime: 300
