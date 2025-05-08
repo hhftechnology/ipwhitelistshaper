@@ -17,9 +17,6 @@ import (
 	"strings"
 	"sync"
 	"time"
-
-
-	"github.com/go-redis/redis/v8"
 )
 
 // Config defines the plugin configuration.
@@ -33,13 +30,6 @@ type Config struct {
 	NotificationURL            string   `json:"notificationURL,omitempty"`
 	KnockEndpoint              string   `json:"knockEndpoint,omitempty"`
 	ApprovalURL                string   `json:"approvalURL,omitempty"`
-	
-	// Redis configuration
-	RedisEnabled   bool   `json:"redisEnabled,omitempty"`
-	RedisAddress   string `json:"redisAddress,omitempty"`
-	RedisPassword  string `json:"redisPassword,omitempty"`
-	RedisDB        int    `json:"redisDB,omitempty"`
-	RedisKeyPrefix string `json:"redisKeyPrefix,omitempty"`
 }
 
 // IPData stores information about whitelisted IPs
@@ -59,13 +49,6 @@ func CreateConfig() *Config {
 		SecretKey:                  generateRandomKey(),
 		KnockEndpoint:              "/knock-knock",
 		ApprovalURL:                "",
-		
-		// Default Redis configuration
-		RedisEnabled:   false,
-		RedisAddress:   "localhost:6379",
-		RedisPassword:  "",
-		RedisDB:        0,
-		RedisKeyPrefix: "ipwhitelistshaper:",
 	}
 }
 
@@ -74,13 +57,12 @@ type IPWhitelistShaper struct {
 	next               http.Handler
 	name               string
 	config             *Config
-	whitelistedIPs     map[string]IPData  // Fallback for when Redis is disabled
-	pendingApprovals   map[string]IPData  // Fallback for when Redis is disabled
+	whitelistedIPs     map[string]IPData
+	pendingApprovals   map[string]IPData
 	lastRequestedIP    map[string]time.Time
 	sourceRangeChecker *sourceRangeChecker
 	mutex              sync.RWMutex
 	wordList           []string
-	redisClient        *redis.Client
 	ctx                context.Context
 }
 
@@ -118,7 +100,7 @@ func New(ctx context.Context, next http.Handler, config *Config, name string) (h
 		"xylophone", "yellow", "zebra", "airplane", "beach", "computer", "dolphin",
 	}
 
-	// Initialize middleware with or without Redis
+	// Initialize middleware
 	middleware := &IPWhitelistShaper{
 		next:               next,
 		name:               name,
@@ -129,23 +111,6 @@ func New(ctx context.Context, next http.Handler, config *Config, name string) (h
 		sourceRangeChecker: checker,
 		wordList:           wordList,
 		ctx:                ctx,
-	}
-	
-	// Initialize Redis client if enabled
-	if config.RedisEnabled {
-		middleware.redisClient = redis.NewClient(&redis.Options{
-			Addr:     config.RedisAddress,
-			Password: config.RedisPassword,
-			DB:       config.RedisDB,
-		})
-		
-		// Ping Redis to verify connection
-		_, err := middleware.redisClient.Ping(ctx).Result()
-		if err != nil {
-			return nil, fmt.Errorf("failed to connect to Redis: %v", err)
-		}
-		
-		fmt.Printf("Successfully connected to Redis at %s\n", config.RedisAddress)
 	}
 	
 	return middleware, nil
@@ -175,105 +140,55 @@ func (i *IPWhitelistShaper) ServeHTTP(rw http.ResponseWriter, req *http.Request)
 	}
 
 	// Check if IP is dynamically whitelisted
-	isWhitelisted := i.isIPWhitelisted(clientIP)
-	if isWhitelisted {
-		i.next.ServeHTTP(rw, req)
-		return
-	}
+	i.mutex.RLock()
+	ipData, isWhitelisted := i.whitelistedIPs[clientIP]
+	i.mutex.RUnlock()
 
-	// Clean up expired whitelisted IPs
-	i.cleanupExpiredWhitelists(clientIP)
+	// Check if IP is in dynamic whitelist and not expired
+	if isWhitelisted {
+		if time.Now().Before(ipData.ExpiresAt) {
+			i.next.ServeHTTP(rw, req)
+			return
+		} else {
+			// IP whitelist has expired, remove it
+			i.mutex.Lock()
+			delete(i.whitelistedIPs, clientIP)
+			i.mutex.Unlock()
+
+			// Send notification about expiration
+			msg := fmt.Sprintf("❌ Removed %s from whitelist. Access revoked.", clientIP)
+			i.sendNotification(msg)
+		}
+	}
 
 	// IP is not whitelisted, return 403 Forbidden
 	rw.WriteHeader(http.StatusForbidden)
 	rw.Write([]byte("IP not whitelisted. Visit " + i.config.KnockEndpoint + " to request access."))
 }
 
-// isIPWhitelisted checks if an IP is in the whitelist
-func (i *IPWhitelistShaper) isIPWhitelisted(clientIP string) bool {
-	if !i.config.RedisEnabled {
-		i.mutex.RLock()
-		ipData, isWhitelisted := i.whitelistedIPs[clientIP]
-		i.mutex.RUnlock()
-		return isWhitelisted && time.Now().Before(ipData.ExpiresAt)
-	}
-	
-	// Check in Redis
-	key := i.config.RedisKeyPrefix + "whitelist:" + clientIP
-	val, err := i.redisClient.Get(i.ctx, key).Result()
-	if err != nil {
-		// Key doesn't exist or Redis error
-		return false
-	}
-	
-	// Parse stored data
-	var ipData IPData
-	err = json.Unmarshal([]byte(val), &ipData)
-	if err != nil {
-		fmt.Printf("Error unmarshaling Redis data for IP %s: %v\n", clientIP, err)
-		return false
-	}
-	
-	// Check if the whitelist entry has expired
-	if time.Now().After(ipData.ExpiresAt) {
-		// Clean up the expired entry
-		i.redisClient.Del(i.ctx, key)
-		return false
-	}
-	
-	return true
-}
-
-// cleanupExpiredWhitelists removes expired dynamic whitelists
-func (i *IPWhitelistShaper) cleanupExpiredWhitelists(clientIP string) {
-	if !i.config.RedisEnabled {
-		// For in-memory maps, check and remove expired entries
-		i.mutex.Lock()
-		defer i.mutex.Unlock()
-		
-		if ipData, exists := i.whitelistedIPs[clientIP]; exists && time.Now().After(ipData.ExpiresAt) {
-			delete(i.whitelistedIPs, clientIP)
-			
-			// Send notification about expiration if configured
-			msg := fmt.Sprintf("❌ Removed %s from whitelist. Access revoked.", clientIP)
-			i.sendNotification(msg)
-		}
-		return
-	}
-	
-	// Redis TTL handles expiration automatically, but we can trigger a manual
-	// cleanup when we see an expired entry to ensure consistency
-	key := i.config.RedisKeyPrefix + "whitelist:" + clientIP
-	ttl, err := i.redisClient.TTL(i.ctx, key).Result()
-	if err == nil && ttl <= 0 {
-		i.redisClient.Del(i.ctx, key)
-		
-		// Send notification about expiration if configured
-		msg := fmt.Sprintf("❌ Removed %s from whitelist. Access revoked.", clientIP)
-		i.sendNotification(msg)
-	}
-}
-
 // handleKnockRequest processes requests to the knock-knock endpoint
 func (i *IPWhitelistShaper) handleKnockRequest(rw http.ResponseWriter, req *http.Request, clientIP string) {
+	i.mutex.Lock()
+	defer i.mutex.Unlock()
+
 	// Check if the IP is already whitelisted
-	isWhitelisted := i.isIPWhitelisted(clientIP)
-	if isWhitelisted {
+	if ipData, isWhitelisted := i.whitelistedIPs[clientIP]; isWhitelisted && time.Now().Before(ipData.ExpiresAt) {
 		// Redirect to root
 		http.Redirect(rw, req, "/", http.StatusFound)
 		return
 	}
 
 	// Check if there's a pending approval for this IP within the last 5 minutes
-	lastRequested, err := i.getLastRequestTime(clientIP)
-	if err == nil && time.Since(lastRequested) < 5*time.Minute {
-		rw.WriteHeader(http.StatusForbidden)
-		rw.Write([]byte("You have already requested approval within the last 5 minutes."))
-		return
+	if lastReq, exists := i.lastRequestedIP[clientIP]; exists {
+		if time.Since(lastReq) < 5*time.Minute {
+			rw.WriteHeader(http.StatusForbidden)
+			rw.Write([]byte("You have already requested approval within the last 5 minutes."))
+			return
+		}
 	}
 
 	// Update the last request time
-	i.setLastRequestTime(clientIP)
+	i.lastRequestedIP[clientIP] = time.Now()
 
 	// Generate token and validation code
 	token := i.generateToken(clientIP)
@@ -283,7 +198,10 @@ func (i *IPWhitelistShaper) handleKnockRequest(rw http.ResponseWriter, req *http
 	expiration := time.Now().Add(time.Duration(i.config.ExpirationTime) * time.Second)
 
 	// Store pending approval
-	i.storePendingApproval(clientIP, token, expiration)
+	i.pendingApprovals[clientIP] = IPData{
+		ExpiresAt:    expiration,
+		ValidationID: token,
+	}
 
 	// Construct approval link
 	approvalURL := i.config.ApprovalURL
@@ -351,73 +269,13 @@ func (i *IPWhitelistShaper) handleKnockRequest(rw http.ResponseWriter, req *http
 	rw.Write([]byte(html))
 }
 
-// getLastRequestTime retrieves the time of the last request for this IP
-func (i *IPWhitelistShaper) getLastRequestTime(clientIP string) (time.Time, error) {
-	if !i.config.RedisEnabled {
-		i.mutex.RLock()
-		lastReq, exists := i.lastRequestedIP[clientIP]
-		i.mutex.RUnlock()
-		if !exists {
-			return time.Time{}, fmt.Errorf("no last request time")
-		}
-		return lastReq, nil
-	}
-	
-	key := i.config.RedisKeyPrefix + "lastreq:" + clientIP
-	val, err := i.redisClient.Get(i.ctx, key).Result()
-	if err != nil {
-		return time.Time{}, err
-	}
-	
-	lastReq, err := time.Parse(time.RFC3339, val)
-	if err != nil {
-		return time.Time{}, err
-	}
-	
-	return lastReq, nil
-}
-
-// setLastRequestTime updates the last request time for this IP
-func (i *IPWhitelistShaper) setLastRequestTime(clientIP string) {
-	now := time.Now()
-	
-	if !i.config.RedisEnabled {
-		i.mutex.Lock()
-		i.lastRequestedIP[clientIP] = now
-		i.mutex.Unlock()
-		return
-	}
-	
-	key := i.config.RedisKeyPrefix + "lastreq:" + clientIP
-	i.redisClient.Set(i.ctx, key, now.Format(time.RFC3339), 24*time.Hour)
-}
-
-// storePendingApproval stores a pending approval request
-func (i *IPWhitelistShaper) storePendingApproval(clientIP, token string, expiration time.Time) {
-	ipData := IPData{
-		ExpiresAt:    expiration,
-		ValidationID: token,
-	}
-	
-	if !i.config.RedisEnabled {
-		i.mutex.Lock()
-		i.pendingApprovals[clientIP] = ipData
-		i.mutex.Unlock()
-		return
-	}
-	
-	// Store in Redis
-	key := i.config.RedisKeyPrefix + "pending:" + clientIP
-	jsonData, _ := json.Marshal(ipData)
-	i.redisClient.Set(i.ctx, key, jsonData, time.Until(expiration))
-}
-
 // handleApproveRequest processes approval requests
 func (i *IPWhitelistShaper) handleApproveRequest(rw http.ResponseWriter, req *http.Request) {
 	// Parse query parameters
 	ip := req.URL.Query().Get("ip")
 	token := req.URL.Query().Get("token")
 	expirationStr := req.URL.Query().Get("expiration")
+	// validationCode := req.URL.Query().Get("validationCode") // Not used but included for UI
 
 	// Validate parameters
 	if ip == "" || token == "" {
@@ -426,8 +284,12 @@ func (i *IPWhitelistShaper) handleApproveRequest(rw http.ResponseWriter, req *ht
 		return
 	}
 
+	// Lock for modifications
+	i.mutex.Lock()
+	defer i.mutex.Unlock()
+
 	// Check if IP and token match
-	pendingData, exists := i.getPendingApproval(ip)
+	pendingData, exists := i.pendingApprovals[ip]
 	if !exists || pendingData.ValidationID != token {
 		rw.WriteHeader(http.StatusForbidden)
 		rw.Write([]byte("Invalid token or IP address"))
@@ -444,11 +306,13 @@ func (i *IPWhitelistShaper) handleApproveRequest(rw http.ResponseWriter, req *ht
 	}
 
 	// Add IP to whitelist
-	expiration := time.Now().Add(time.Duration(expirationTime) * time.Second)
-	i.addToWhitelist(ip, token, expiration)
-	
+	i.whitelistedIPs[ip] = IPData{
+		ExpiresAt:    time.Now().Add(time.Duration(expirationTime) * time.Second),
+		ValidationID: token,
+	}
+
 	// Remove from pending approvals
-	i.removePendingApproval(ip)
+	delete(i.pendingApprovals, ip)
 
 	// Send notification
 	message := fmt.Sprintf("✅ Whitelisted %s for %d seconds", ip, expirationTime)
@@ -505,63 +369,6 @@ func (i *IPWhitelistShaper) handleApproveRequest(rw http.ResponseWriter, req *ht
 
 	rw.Header().Set("Content-Type", "text/html")
 	rw.Write([]byte(html))
-}
-
-// getPendingApproval retrieves a pending approval request
-func (i *IPWhitelistShaper) getPendingApproval(ip string) (IPData, bool) {
-	if !i.config.RedisEnabled {
-		i.mutex.RLock()
-		data, exists := i.pendingApprovals[ip]
-		i.mutex.RUnlock()
-		return data, exists
-	}
-	
-	key := i.config.RedisKeyPrefix + "pending:" + ip
-	val, err := i.redisClient.Get(i.ctx, key).Result()
-	if err != nil {
-		return IPData{}, false
-	}
-	
-	var ipData IPData
-	err = json.Unmarshal([]byte(val), &ipData)
-	if err != nil {
-		fmt.Printf("Error unmarshaling pending approval data: %v\n", err)
-		return IPData{}, false
-	}
-	
-	return ipData, true
-}
-
-// addToWhitelist adds an IP to the whitelist
-func (i *IPWhitelistShaper) addToWhitelist(ip, token string, expiration time.Time) {
-	ipData := IPData{
-		ExpiresAt:    expiration,
-		ValidationID: token,
-	}
-	
-	if !i.config.RedisEnabled {
-		i.mutex.Lock()
-		i.whitelistedIPs[ip] = ipData
-		i.mutex.Unlock()
-		return
-	}
-	
-	key := i.config.RedisKeyPrefix + "whitelist:" + ip
-	jsonData, _ := json.Marshal(ipData)
-	i.redisClient.Set(i.ctx, key, jsonData, time.Until(expiration))
-}
-
-// removePendingApproval removes a pending approval request
-func (i *IPWhitelistShaper) removePendingApproval(ip string) {
-	if !i.config.RedisEnabled {
-		i.mutex.Lock()
-		delete(i.pendingApprovals, ip)
-		i.mutex.Unlock()
-		return
-	}
-	
-	key := i.config.RedisKeyPrefix + "pending:" + ip
-	i.redisClient.Del(i.ctx, key)
 }
 
 // generateToken creates a secure token for an IP
@@ -774,12 +581,4 @@ func generateRandomKey() string {
 		bytes[i] = byte(r.Intn(256))
 	}
 	return hex.EncodeToString(bytes)
-}
-
-// Close cleans up resources when the middleware is being shut down
-func (i *IPWhitelistShaper) Close() error {
-	if i.config.RedisEnabled && i.redisClient != nil {
-		return i.redisClient.Close()
-	}
-	return nil
 }
