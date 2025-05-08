@@ -152,10 +152,11 @@ func New(ctx context.Context, next http.Handler, config *Config, name string) (h
 		} else if err == nil {
 			fmt.Printf("[%s] INFO Initial state loaded successfully from %s.\n", name, config.StoragePath)
 		}
-		// --- Re-enable background tasks ---
-		go middleware.periodicStateSaving()
-		go middleware.cleanupExpiredEntries()
-		// ----------------------------------
+		// --- Temporarily disable background tasks for testing ---
+		// go middleware.periodicStateSaving()
+		// go middleware.cleanupExpiredEntries()
+		fmt.Printf("[%s] WARNING: Periodic saving and cleanup are temporarily disabled for debugging.\n", name)
+		// --------------------------------------------------------
 	}
 
 	return middleware, nil
@@ -200,7 +201,7 @@ func (i *IPWhitelistShaper) ServeHTTP(rw http.ResponseWriter, req *http.Request)
 
 // handleKnockRequest processes requests to the knock-knock endpoint
 func (i *IPWhitelistShaper) handleKnockRequest(rw http.ResponseWriter, req *http.Request, clientIP string) {
-	i.mutex.Lock() // Lock for check-and-set operations
+	i.mutex.Lock()
 
 	if ipData, isWhitelisted := i.whitelistedIPs[clientIP]; isWhitelisted && time.Now().Before(ipData.ExpiresAt) {
 		i.mutex.Unlock()
@@ -218,21 +219,19 @@ func (i *IPWhitelistShaper) handleKnockRequest(rw http.ResponseWriter, req *http
 	if pendingData, exists := i.pendingApprovals[clientIP]; exists && time.Now().Before(pendingData.ExpiresAt) {
 		i.lastRequestedIP[clientIP] = time.Now()
 		validationCode := pendingData.ValidationCode
-		// *** Save state synchronously WITHIN the lock before unlocking ***
-		saveErr := i.saveStateToFile() // Assumes lock is held
-		i.mutex.Unlock() // Unlock AFTER save attempt
-		if saveErr != nil {
-			fmt.Printf("[%s] ERROR saving state during knock re-request: %v\n", i.name, saveErr)
-			// Decide how to handle save error - maybe still show page?
+		i.mutex.Unlock()
+		if i.config.StorageEnabled {
+			if err := i.saveState(); err != nil { // Sync save lastRequestedIP update
+				fmt.Printf("[%s] ERROR saving state during knock re-request: %v\n", i.name, err)
+			}
 		}
 		i.serveKnockPage(rw, validationCode, "An approval request is already pending. Please use the validation code below.")
 		return
 	}
 
-	// --- Generate new approval request ---
 	token := i.generateToken(clientIP)
 	validationCode := i.getRandomWord()
-	pendingExpiration := time.Now().Add(1 * time.Hour) // Pending request valid for 1 hour
+	pendingExpiration := time.Now().Add(1 * time.Hour)
 
 	i.pendingApprovals[clientIP] = IPData{
 		ExpiresAt:      pendingExpiration,
@@ -241,18 +240,16 @@ func (i *IPWhitelistShaper) handleKnockRequest(rw http.ResponseWriter, req *http
 	}
 	i.lastRequestedIP[clientIP] = time.Now()
 
-	// *** Save state synchronously WITHIN the lock ***
-	saveErr := i.saveStateToFile() // Assumes lock is held
-	i.mutex.Unlock() // Unlock AFTER save attempt
+	i.mutex.Unlock() // Unlock before synchronous save
 
-	if saveErr != nil {
-		fmt.Printf("[%s] ERROR saving state after creating pending approval: %v\n", i.name, saveErr)
-		// Consider returning an error if saving fails
-	} else {
-		fmt.Printf("[%s] INFO State saved synchronously for pending approval IP: %s\n", i.name, clientIP)
+	if i.config.StorageEnabled {
+		if err := i.saveState(); err != nil { // Synchronous save
+			fmt.Printf("[%s] ERROR saving state after creating pending approval: %v\n", i.name, err)
+		} else {
+			fmt.Printf("[%s] INFO State saved synchronously for pending approval IP: %s\n", i.name, clientIP)
+		}
 	}
 
-	// Construct approval link
 	approvalURLBase := i.config.ApprovalURL
 	if approvalURLBase == "" {
 		approvalURLBase = fmt.Sprintf("%s://%s", getScheme(req), req.Host)
@@ -270,7 +267,7 @@ func (i *IPWhitelistShaper) handleKnockRequest(rw http.ResponseWriter, req *http
 
 // serveKnockPage sends the HTML response for the knock endpoint
 func (i *IPWhitelistShaper) serveKnockPage(rw http.ResponseWriter, validationCode, message string) {
-	// (HTML content remains the same)
+	// (HTML content remains the same as previous version)
 	html := fmt.Sprintf(`
 		<!DOCTYPE html>
 		<html lang="en">
@@ -338,6 +335,7 @@ func (i *IPWhitelistShaper) handleApproveRequest(rw http.ResponseWriter, req *ht
 	// Check if IP and token match the *now loaded* pending approval data
 	pendingData, exists := i.pendingApprovals[ip]
 	if !exists {
+		// *** ADDED LOGGING: More context if not found ***
 		fmt.Printf("[%s] ERROR No pending approval found in current state for IP: %s (Token: %s). Approval attempt failed.\n", i.name, ip, token)
 		http.Error(rw, "Invalid token or IP address: No pending approval found", http.StatusForbidden)
 		return
