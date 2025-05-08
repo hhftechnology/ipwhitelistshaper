@@ -323,12 +323,36 @@ func (i *IPWhitelistShaper) handleKnockRequest(rw http.ResponseWriter, req *http
 	rw.Header().Set("Content-Type", "text/html")
 	rw.Write([]byte(html))
 }
-
+func (i *IPWhitelistShaper) debugState(ip, token string) {
+    // Check memory state
+    fmt.Printf("DEBUG: Memory state - PendingApprovals: %+v\n", i.pendingApprovals)
+    
+    // Check file state
+    if i.config.StorageEnabled {
+        stateFile := filepath.Join(i.config.StoragePath, "state.json")
+        data, err := ioutil.ReadFile(stateFile)
+        if err != nil {
+            fmt.Printf("ERROR: Failed to read state file: %v\n", err)
+            return
+        }
+        
+        fmt.Printf("DEBUG: File state content: %s\n", string(data))
+        
+        var state StoredState
+        err = json.Unmarshal(data, &state)
+        if err != nil {
+            fmt.Printf("ERROR: Failed to unmarshal state: %v\n", err)
+            return
+        }
+        
+        fmt.Printf("DEBUG: File state - PendingApprovals: %+v\n", state.PendingApprovals)
+    }
+}
 // handleApproveRequest processes approval requests
 func (i *IPWhitelistShaper) handleApproveRequest(rw http.ResponseWriter, req *http.Request) {
     // FIXED: Removed duplicate code retrieval (rawIP and rawToken)
     fmt.Printf("DEBUG: Received approval request with URL: %s\n", req.URL.String())
-    
+    i.debugState(req.URL.Query().Get("ip"), req.URL.Query().Get("token"))
     // Get encoded parameters from URL
     ipEncoded := req.URL.Query().Get("ip")
     tokenEncoded := req.URL.Query().Get("token")
@@ -339,6 +363,13 @@ func (i *IPWhitelistShaper) handleApproveRequest(rw http.ResponseWriter, req *ht
     ip, err1 := url.QueryUnescape(ipEncoded)
     token, err2 := url.QueryUnescape(tokenEncoded)
     validationCode, err3 := url.QueryUnescape(validationCodeEncoded)
+
+	if i.config.StorageEnabled {
+        err := i.loadState()
+        if err != nil {
+            fmt.Printf("ERROR: Failed to reload state before processing approval: %v\n", err)
+        }
+    }
 
     // Handle decoding errors with better error reporting
     if err1 != nil {
@@ -542,7 +573,7 @@ func (i *IPWhitelistShaper) saveState() error {
 	}
 	
 	// Write to a temporary file first
-	tempFile := filepath.Join(i.config.StoragePath, "state.json.tmp")
+	tempFile := filepath.Join(i.config.StoragePath, fmt.Sprintf("state.json.tmp.%d", time.Now().UnixNano()))
 	err = ioutil.WriteFile(tempFile, data, 0644)
 	if err != nil {
 		return fmt.Errorf("failed to write temporary state file: %v", err)
@@ -559,62 +590,76 @@ func (i *IPWhitelistShaper) saveState() error {
 }
 
 // loadState loads the state from disk
+// Update loadState to avoid lock contention
 func (i *IPWhitelistShaper) loadState() error {
-	if !i.config.StorageEnabled {
-		return nil
-	}
-	
-	stateFile := filepath.Join(i.config.StoragePath, "state.json")
-	
-	// Check if file exists
-	if _, err := os.Stat(stateFile); os.IsNotExist(err) {
-		return nil // Not an error, just no state yet
-	}
-	
-	// Read file
-	data, err := ioutil.ReadFile(stateFile)
-	if err != nil {
-		return fmt.Errorf("failed to read state file: %v", err)
-	}
-	
-	// Unmarshal from JSON
-	var state StoredState
-	err = json.Unmarshal(data, &state)
-	if err != nil {
-		return fmt.Errorf("failed to unmarshal state: %v", err)
-	}
-	
-	i.mutex.Lock()
-	defer i.mutex.Unlock()
-	
-	// Restore whitelisted IPs
-	for ip, data := range state.WhitelistedIPs {
-		// Skip expired entries
-		if time.Now().After(data.ExpiresAt) {
-			continue
-		}
-		i.whitelistedIPs[ip] = data
-	}
-	
-	// Restore pending approvals
-	for ip, data := range state.PendingApprovals {
-		// Skip expired entries
-		if time.Now().After(data.ExpiresAt) {
-			continue
-		}
-		i.pendingApprovals[ip] = data
-	}
-	
-	// Restore last requested times
-	for ip, timeStr := range state.LastRequestedIP {
-		lastTime, err := time.Parse(time.RFC3339, timeStr)
-		if err != nil {
-			continue // Skip this entry if we can't parse the time
-		}
-		i.lastRequestedIP[ip] = lastTime
-	}
-	
-	return nil
+    if !i.config.StorageEnabled {
+        return nil
+    }
+    
+    stateFile := filepath.Join(i.config.StoragePath, "state.json")
+    
+    // Check if file exists
+    if _, err := os.Stat(stateFile); os.IsNotExist(err) {
+        return nil // Not an error, just no state yet
+    }
+    
+    // Read file
+    data, err := ioutil.ReadFile(stateFile)
+    if err != nil {
+        return fmt.Errorf("failed to read state file: %v", err)
+    }
+    
+    // Unmarshal from JSON
+    var state StoredState
+    err = json.Unmarshal(data, &state)
+    if err != nil {
+        return fmt.Errorf("failed to unmarshal state: %v", err)
+    }
+    
+    // Ensure we're not holding the lock while reading the file
+    tempWhitelistedIPs := make(map[string]IPData)
+    tempPendingApprovals := make(map[string]IPData)
+    tempLastRequestedIP := make(map[string]time.Time)
+    
+    // Process whitelisted IPs
+    for ip, data := range state.WhitelistedIPs {
+        if time.Now().After(data.ExpiresAt) {
+            continue // Skip expired entries
+        }
+        tempWhitelistedIPs[ip] = data
+    }
+    
+    // Process pending approvals - print each one for debugging
+    for ip, data := range state.PendingApprovals {
+        fmt.Printf("DEBUG: Loading pending approval for IP %s with token %s and code %s (expires: %s)\n", 
+            ip, data.ValidationID, data.ValidationCode, data.ExpiresAt.Format(time.RFC3339))
+        
+        if time.Now().After(data.ExpiresAt) {
+            fmt.Printf("DEBUG: Skipping expired pending approval for IP %s\n", ip)
+            continue // Skip expired entries
+        }
+        tempPendingApprovals[ip] = data
+    }
+    
+    // Process last requested times
+    for ip, timeStr := range state.LastRequestedIP {
+        lastTime, err := time.Parse(time.RFC3339, timeStr)
+        if err != nil {
+            continue // Skip this entry if we can't parse the time
+        }
+        tempLastRequestedIP[ip] = lastTime
+    }
+    
+    // Now acquire the lock and update the maps
+    i.mutex.Lock()
+    i.whitelistedIPs = tempWhitelistedIPs
+    i.pendingApprovals = tempPendingApprovals
+    i.lastRequestedIP = tempLastRequestedIP
+    i.mutex.Unlock()
+    
+    fmt.Printf("DEBUG: State loaded successfully with %d pending approvals\n", len(tempPendingApprovals))
+    
+    return nil
 }
 
 // Close cleans up resources and ensures state is saved
