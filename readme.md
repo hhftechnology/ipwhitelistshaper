@@ -147,7 +147,7 @@ http:
       
     # Special router to handle the approval endpoint
     approve-router:
-      rule: "Host(`service.example.com`) && PathPrefix(`/approve`)"
+      rule: "Host(`service.example.com`) && PathPrefix(`/approve/`)"
       service: "my-service"
       middlewares:
         - "my-ipwhitelistshaper"
@@ -209,6 +209,69 @@ ipwhitelistshaper:
     - "103.22.200.0/22"
     # Add more CloudFlare IP ranges
 ```
+## For Middleware-manager
+```yaml
+  - id: "ipwhitelistshaper"
+    name: "IP Whitelist Shaper"
+    type: "plugin"
+    config:
+      ipwhitelistshaper:
+        knockEndpoint: "/knock-knock"
+        approvalURL: "https://wallos.development.hhf.technology"
+        notificationURL: "https://discord.com/api/webhooks/"
+        defaultPrivateClassSources: true
+        expirationTime: 300
+        ipStrategyDepth: 0
+        secretKey: ""
+        excludedIPs: []
+        whitelistedIPs:
+          - "127.0.0.1/32"
+          - "192.168.1.0/24"
+          - "10.0.0.0/8"
+        storageEnabled: true
+        storagePath: "/plugins-storage/ipwhitelistshaper"
+        saveInterval: 30
+```
+```yaml
+providers:
+  http:
+    endpoint: "http://pangolin:3001/api/v1/traefik-config"
+    pollInterval: "5s"
+  file:
+    directory: "/rules"
+    watch: true
+
+experimental:
+  plugins:
+    badger:
+      moduleName: "github.com/fosrl/badger"
+      version: "v1.1.0"
+  localPlugins:
+    ipwhitelistshaper:
+      moduleName: "github.com/hhftechnology/ipwhitelistshaper"
+```
+```yaml
+  traefik:
+    image: traefik:v3.3.3
+    container_name: traefik
+    restart: unless-stopped
+
+    network_mode: service:gerbil # Ports appear on the gerbil service
+
+    depends_on:
+      pangolin:
+        condition: service_healthy
+    command:
+      - --configFile=/etc/traefik/traefik_config.yml
+    volumes:
+      - ./config/traefik:/etc/traefik:ro # Volume to store the Traefik configuration
+      - ./config/letsencrypt:/letsencrypt # Volume to store the Let's Encrypt certificates
+      - ./config/traefik/logs:/var/log/traefik # Volume to store Traefik logs
+      - ./traefik/plugins-storage:/plugins-storage:rw
+      - ./traefik/plugins-storage:/plugins-local:rw
+      - ./config/traefik/rules:/rules
+```
+
 
 ## Troubleshooting
 
