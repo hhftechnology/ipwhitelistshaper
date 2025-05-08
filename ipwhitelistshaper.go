@@ -196,7 +196,7 @@ func (i *IPWhitelistShaper) ServeHTTP(rw http.ResponseWriter, req *http.Request)
 	}
 
 	rw.WriteHeader(http.StatusForbidden)
-	rw.Write([]byte("IP not whitelisted. Visit " + i.config.KnockEndpoint + " to request access."))
+	rw.Write([]byte("403 Forbidden"))
 }
 
 // handleKnockRequest processes requests to the knock-knock endpoint

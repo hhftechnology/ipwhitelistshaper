@@ -42,7 +42,7 @@ experimental:
   plugins:
     ipwhitelistshaper:
       moduleName: github.com/hhftechnology/ipwhitelistshaper
-      version: v1.0.0
+      version: v1.0.3
 ```
 
 ### Dynamic Configuration
@@ -303,5 +303,4 @@ If state is not being properly maintained:
 
 ## License
 
-Apache License 2.0
 ```
