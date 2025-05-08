@@ -1,3 +1,5 @@
+// filename: ipwhitelistshaper.go
+// Package ipwhitelistshaper provides a Traefik middleware for dynamic IP whitelist management
 package ipwhitelistshaper
 
 import (
@@ -67,7 +69,7 @@ func CreateConfig() *Config {
 		// Default file storage configuration
 		StorageEnabled: true,
 		StoragePath:    "/plugins-storage/ipwhitelistshaper",
-		SaveInterval:   30, // Save every 30 seconds by default
+		SaveInterval:   30, // Default every 30 seconds
 	}
 }
 
@@ -145,14 +147,15 @@ func New(ctx context.Context, next http.Handler, config *Config, name string) (h
 			cancel() // Cancel context if setup fails
 			return nil, fmt.Errorf("failed to create storage directory '%s': %v", config.StoragePath, err)
 		}
-		// Load initial state. Log warning if file doesn't exist or is corrupt, but continue.
 		if err = middleware.loadState(); err != nil && !os.IsNotExist(err) {
 			fmt.Printf("[%s] Warning: Could not load initial state from %s: %v\n", name, config.StoragePath, err)
 		} else if err == nil {
 			fmt.Printf("[%s] INFO Initial state loaded successfully from %s.\n", name, config.StoragePath)
 		}
+		// --- Re-enable background tasks ---
 		go middleware.periodicStateSaving()
-		go middleware.cleanupExpiredEntries() // Start cleanup goroutine
+		go middleware.cleanupExpiredEntries()
+		// ----------------------------------
 	}
 
 	return middleware, nil
@@ -172,33 +175,25 @@ func (i *IPWhitelistShaper) ServeHTTP(rw http.ResponseWriter, req *http.Request)
 		return
 	}
 	if strings.HasPrefix(req.URL.Path, "/approve") {
-		i.handleApproveRequest(rw, req) // IP is extracted from query params here
+		i.handleApproveRequest(rw, req)
 		return
 	}
 
 	// --- Regular Request Flow ---
-
-	// 1. Check static whitelist
 	if i.sourceRangeChecker.contains(clientIP) {
 		i.next.ServeHTTP(rw, req)
 		return
 	}
 
-	// 2. Check dynamic whitelist (read lock)
 	i.mutex.RLock()
 	ipData, isWhitelisted := i.whitelistedIPs[clientIP]
 	i.mutex.RUnlock()
 
-	if isWhitelisted {
-		// Check expiration *after* releasing read lock
-		if time.Now().Before(ipData.ExpiresAt) {
-			i.next.ServeHTTP(rw, req) // Allowed
-			return
-		}
-		// Entry expired, fall through to forbidden (cleanup happens periodically)
+	if isWhitelisted && time.Now().Before(ipData.ExpiresAt) {
+		i.next.ServeHTTP(rw, req)
+		return
 	}
 
-	// 3. Not whitelisted -> Forbidden
 	rw.WriteHeader(http.StatusForbidden)
 	rw.Write([]byte("IP not whitelisted. Visit " + i.config.KnockEndpoint + " to request access."))
 }
@@ -207,14 +202,12 @@ func (i *IPWhitelistShaper) ServeHTTP(rw http.ResponseWriter, req *http.Request)
 func (i *IPWhitelistShaper) handleKnockRequest(rw http.ResponseWriter, req *http.Request, clientIP string) {
 	i.mutex.Lock() // Lock for check-and-set operations
 
-	// Check if already whitelisted
 	if ipData, isWhitelisted := i.whitelistedIPs[clientIP]; isWhitelisted && time.Now().Before(ipData.ExpiresAt) {
 		i.mutex.Unlock()
 		http.Redirect(rw, req, "/", http.StatusFound)
 		return
 	}
 
-	// Rate limit check: Has a request been made recently?
 	if lastReq, exists := i.lastRequestedIP[clientIP]; exists && time.Since(lastReq) < 1*time.Minute {
 		i.mutex.Unlock()
 		rw.WriteHeader(http.StatusTooManyRequests)
@@ -222,17 +215,15 @@ func (i *IPWhitelistShaper) handleKnockRequest(rw http.ResponseWriter, req *http
 		return
 	}
 
-	// Check if there's already a *valid* pending approval
 	if pendingData, exists := i.pendingApprovals[clientIP]; exists && time.Now().Before(pendingData.ExpiresAt) {
 		i.lastRequestedIP[clientIP] = time.Now()
 		validationCode := pendingData.ValidationCode
-		i.mutex.Unlock() // Unlock before potentially slow save/notify
-
-		// Save state synchronously to ensure lastRequestedIP is updated immediately
-		if i.config.StorageEnabled {
-			if err := i.saveState(); err != nil {
-				fmt.Printf("[%s] ERROR saving state during knock re-request: %v\n", i.name, err)
-			}
+		// *** Save state synchronously WITHIN the lock before unlocking ***
+		saveErr := i.saveStateToFile() // Assumes lock is held
+		i.mutex.Unlock() // Unlock AFTER save attempt
+		if saveErr != nil {
+			fmt.Printf("[%s] ERROR saving state during knock re-request: %v\n", i.name, saveErr)
+			// Decide how to handle save error - maybe still show page?
 		}
 		i.serveKnockPage(rw, validationCode, "An approval request is already pending. Please use the validation code below.")
 		return
@@ -250,18 +241,15 @@ func (i *IPWhitelistShaper) handleKnockRequest(rw http.ResponseWriter, req *http
 	}
 	i.lastRequestedIP[clientIP] = time.Now()
 
-	i.mutex.Unlock() // Unlock *before* saving state and sending notification
+	// *** Save state synchronously WITHIN the lock ***
+	saveErr := i.saveStateToFile() // Assumes lock is held
+	i.mutex.Unlock() // Unlock AFTER save attempt
 
-	// *** Make save synchronous to ensure data is persisted before link is sent ***
-	if i.config.StorageEnabled {
-		if err := i.saveState(); err != nil {
-			fmt.Printf("[%s] ERROR saving state after creating pending approval: %v\n", i.name, err)
-			// Consider returning an error to the user if saving fails critically
-			// http.Error(rw, "Internal server error", http.StatusInternalServerError)
-			// return
-		} else {
-			fmt.Printf("[%s] INFO State saved synchronously for pending approval IP: %s\n", i.name, clientIP)
-		}
+	if saveErr != nil {
+		fmt.Printf("[%s] ERROR saving state after creating pending approval: %v\n", i.name, saveErr)
+		// Consider returning an error if saving fails
+	} else {
+		fmt.Printf("[%s] INFO State saved synchronously for pending approval IP: %s\n", i.name, clientIP)
 	}
 
 	// Construct approval link
@@ -273,18 +261,16 @@ func (i *IPWhitelistShaper) handleKnockRequest(rw http.ResponseWriter, req *http
 		approvalURLBase, url.QueryEscape(clientIP), url.QueryEscape(token),
 		url.QueryEscape(validationCode), i.config.ExpirationTime)
 
-	// Send notification
 	message := fmt.Sprintf("Access request from %s\nValidation code: %s\nApprove: %s",
 		clientIP, validationCode, approvalLink)
 	i.sendNotification(message)
 
-	// Return response to user
 	i.serveKnockPage(rw, validationCode, "Your request requires approval. Please provide the validation code to the administrator.")
 }
 
 // serveKnockPage sends the HTML response for the knock endpoint
 func (i *IPWhitelistShaper) serveKnockPage(rw http.ResponseWriter, validationCode, message string) {
-	// (HTML content remains the same as previous version)
+	// (HTML content remains the same)
 	html := fmt.Sprintf(`
 		<!DOCTYPE html>
 		<html lang="en">
@@ -341,31 +327,30 @@ func (i *IPWhitelistShaper) handleApproveRequest(rw http.ResponseWriter, req *ht
 	if i.config.StorageEnabled {
 		err := i.loadStateFromFile() // Use internal load method that assumes lock is held
 		if err != nil && !os.IsNotExist(err) {
-			// Log the error AND return an internal server error, as we can't trust the state
 			fmt.Printf("[%s] ERROR Failed to reload state before processing approval for IP %s: %v\n", i.name, ip, err)
 			http.Error(rw, "Internal server error: Failed to load state", http.StatusInternalServerError)
 			return
 		}
-		fmt.Printf("[%s] INFO State reloaded successfully within handleApproveRequest for IP %s.\n", i.name, ip)
+		// *** ADDED LOGGING: Log the state *after* loading ***
+		fmt.Printf("[%s] DEBUG State loaded in handleApproveRequest for IP %s. Current pending map size: %d. Content: %+v\n", i.name, ip, len(i.pendingApprovals), i.pendingApprovals)
 	}
 
 	// Check if IP and token match the *now loaded* pending approval data
 	pendingData, exists := i.pendingApprovals[ip]
 	if !exists {
-		fmt.Printf("[%s] ERROR No pending approval found in current state for IP: %s (Token: %s). Current pending map size: %d\n", i.name, ip, token, len(i.pendingApprovals))
+		fmt.Printf("[%s] ERROR No pending approval found in current state for IP: %s (Token: %s). Approval attempt failed.\n", i.name, ip, token)
 		http.Error(rw, "Invalid token or IP address: No pending approval found", http.StatusForbidden)
 		return
 	}
 
 	if pendingData.ValidationID != token {
-		fmt.Printf("[%s] ERROR Token mismatch for IP: %s. Expected: '%s', Got: '%s'\n", i.name, ip, pendingData.ValidationID, token)
+		fmt.Printf("[%s] ERROR Token mismatch for IP: %s. Expected in state: '%s', Got from URL: '%s'\n", i.name, ip, pendingData.ValidationID, token)
 		http.Error(rw, "Invalid token or IP address: Token mismatch", http.StatusForbidden)
 		return
 	}
 
-	// Validate the validation code
 	if pendingData.ValidationCode != validationCode {
-		fmt.Printf("[%s] ERROR Validation code mismatch for IP: %s. Expected: '%s', Got: '%s'\n", i.name, ip, pendingData.ValidationCode, validationCode)
+		fmt.Printf("[%s] ERROR Validation code mismatch for IP: %s. Expected in state: '%s', Got from URL: '%s'\n", i.name, ip, pendingData.ValidationCode, validationCode)
 		http.Error(rw, "Invalid validation code", http.StatusForbidden)
 		return
 	}
@@ -379,24 +364,18 @@ func (i *IPWhitelistShaper) handleApproveRequest(rw http.ResponseWriter, req *ht
 		}
 	}
 
-	// Add IP to the dynamic whitelist
 	expiresAt := time.Now().Add(time.Duration(expirationTime) * time.Second)
 	i.whitelistedIPs[ip] = IPData{
 		ExpiresAt:      expiresAt,
 		ValidationID:   token,
 		ValidationCode: pendingData.ValidationCode,
 	}
+	delete(i.pendingApprovals, ip) // Remove from pending
 
-	// Remove from pending approvals
-	delete(i.pendingApprovals, ip)
-
-	// Save state (can be async here as the critical update is done)
+	// Save state synchronously within the lock
 	if i.config.StorageEnabled {
-		// Use the internal save function which assumes lock is held
-		// Run it synchronously within the lock to ensure consistency before response
 		if err := i.saveStateToFile(); err != nil {
 			fmt.Printf("[%s] ERROR saving state after approval (within lock): %v\n", i.name, err)
-			// Consider if an error should be returned to the user
 		} else {
 			fmt.Printf("[%s] INFO State saved synchronously after approval for IP %s.\n", i.name, ip)
 		}
@@ -404,8 +383,6 @@ func (i *IPWhitelistShaper) handleApproveRequest(rw http.ResponseWriter, req *ht
 	// --- End Critical Section ---
 
 	fmt.Printf("[%s] INFO Approved IP: %s, expiration: %d seconds\n", i.name, ip, expirationTime)
-
-	// Send notification
 	message := fmt.Sprintf("✅ Whitelisted %s for %d seconds", ip, expirationTime)
 	i.sendNotification(message)
 
@@ -453,7 +430,7 @@ func (i *IPWhitelistShaper) periodicStateSaving() {
 	for {
 		select {
 		case <-ticker.C:
-			i.mutex.RLock() // RLock sufficient for reading data to save
+			i.mutex.RLock()
 			err := i.saveStateToFile()
 			i.mutex.RUnlock()
 			if err != nil {
@@ -486,10 +463,8 @@ func (i *IPWhitelistShaper) cleanupExpiredEntries() {
 		case <-ticker.C:
 			now := time.Now()
 			needsSave := false
+			i.mutex.Lock()
 
-			i.mutex.Lock() // Full lock needed for modification
-
-			// Clean whitelisted IPs
 			for ip, data := range i.whitelistedIPs {
 				if now.After(data.ExpiresAt) {
 					delete(i.whitelistedIPs, ip)
@@ -497,8 +472,6 @@ func (i *IPWhitelistShaper) cleanupExpiredEntries() {
 					fmt.Printf("[%s] INFO Cleaned up expired whitelist entry for IP: %s\n", i.name, ip)
 				}
 			}
-
-			// Clean pending approvals
 			for ip, data := range i.pendingApprovals {
 				if now.After(data.ExpiresAt) {
 					delete(i.pendingApprovals, ip)
@@ -506,8 +479,6 @@ func (i *IPWhitelistShaper) cleanupExpiredEntries() {
 					fmt.Printf("[%s] INFO Cleaned up expired pending approval for IP: %s\n", i.name, ip)
 				}
 			}
-
-			// Clean last requested IPs (e.g., remove entries older than 1 hour)
 			limit := now.Add(-1 * time.Hour)
 			for ip, t := range i.lastRequestedIP {
 				if t.Before(limit) {
@@ -515,10 +486,8 @@ func (i *IPWhitelistShaper) cleanupExpiredEntries() {
 					needsSave = true
 				}
 			}
+			i.mutex.Unlock()
 
-			i.mutex.Unlock() // Unlock after modifications
-
-			// Save state if anything was cleaned up
 			if needsSave && i.config.StorageEnabled {
 				go func() { // Save in background
 					if err := i.saveState(); err != nil {
@@ -526,7 +495,6 @@ func (i *IPWhitelistShaper) cleanupExpiredEntries() {
 					}
 				}()
 			}
-
 		case <-i.stopChan:
 			return
 		case <-i.ctx.Done():
@@ -555,7 +523,9 @@ func (i *IPWhitelistShaper) saveStateToFile() error {
 	}
 	now := time.Now()
 
-	// Copy non-expired entries only
+	// *** ADDED LOGGING: Log pending approvals being saved ***
+	fmt.Printf("[%s] DEBUG Saving state. Pending approvals to save: %+v\n", i.name, i.pendingApprovals)
+
 	for ip, data := range i.whitelistedIPs {
 		if now.Before(data.ExpiresAt) {
 			state.WhitelistedIPs[ip] = data
@@ -588,7 +558,6 @@ func (i *IPWhitelistShaper) saveStateToFile() error {
 		os.Remove(tempFile)
 		return fmt.Errorf("failed to rename temporary state file to %s: %v", stateFile, err)
 	}
-	// fmt.Printf("[%s] DEBUG State saved successfully to %s\n", i.name, stateFile) // Optional debug log
 	return nil
 }
 
@@ -611,7 +580,8 @@ func (i *IPWhitelistShaper) loadStateFromFile() error {
 			i.whitelistedIPs = make(map[string]IPData)
 			i.pendingApprovals = make(map[string]IPData)
 			i.lastRequestedIP = make(map[string]time.Time)
-			return nil // File not existing is okay on first start
+			fmt.Printf("[%s] INFO State file %s not found, initializing empty state.\n", i.name, stateFile)
+			return nil
 		}
 		return fmt.Errorf("failed to read state file %s: %v", stateFile, err)
 	}
@@ -622,7 +592,7 @@ func (i *IPWhitelistShaper) loadStateFromFile() error {
 		i.whitelistedIPs = make(map[string]IPData)
 		i.pendingApprovals = make(map[string]IPData)
 		i.lastRequestedIP = make(map[string]time.Time)
-		return nil // Continue with empty state if file is corrupt
+		return nil
 	}
 
 	now := time.Now()
@@ -632,23 +602,17 @@ func (i *IPWhitelistShaper) loadStateFromFile() error {
 
 	if state.WhitelistedIPs != nil {
 		for ip, data := range state.WhitelistedIPs {
-			if now.Before(data.ExpiresAt) {
-				tempWhitelistedIPs[ip] = data
-			}
+			if now.Before(data.ExpiresAt) { tempWhitelistedIPs[ip] = data }
 		}
 	}
 	if state.PendingApprovals != nil {
 		for ip, data := range state.PendingApprovals {
-			if now.Before(data.ExpiresAt) {
-				tempPendingApprovals[ip] = data
-			}
+			if now.Before(data.ExpiresAt) { tempPendingApprovals[ip] = data }
 		}
 	}
 	if state.LastRequestedIP != nil {
 		for ip, timeStr := range state.LastRequestedIP {
-			if lastTime, err := time.Parse(time.RFC3339, timeStr); err == nil {
-				tempLastRequestedIP[ip] = lastTime
-			}
+			if lastTime, err := time.Parse(time.RFC3339, timeStr); err == nil { tempLastRequestedIP[ip] = lastTime }
 		}
 	}
 
@@ -656,56 +620,47 @@ func (i *IPWhitelistShaper) loadStateFromFile() error {
 	i.pendingApprovals = tempPendingApprovals
 	i.lastRequestedIP = tempLastRequestedIP
 
-	// fmt.Printf("[%s] DEBUG State loaded from file. Pending approvals: %d\n", i.name, len(i.pendingApprovals)) // Optional debug log
+	// *** ADDED LOGGING: Log state after loading from file ***
+	fmt.Printf("[%s] DEBUG State loaded from file %s. Pending approvals map size: %d. Content: %+v\n", i.name, stateFile, len(i.pendingApprovals), i.pendingApprovals)
 	return nil
 }
 
 // Close cleans up resources and ensures state is saved
 func (i *IPWhitelistShaper) Close() error {
 	fmt.Printf("[%s] INFO Shutting down IPWhitelistShaper middleware.\n", i.name)
-	// Signal background goroutines to stop
-	i.cancel()   // Cancel the context
-	close(i.stopChan) // Close the dedicated stop channel
-
-	// Save state one last time
+	i.cancel()
+	close(i.stopChan)
 	if i.config.StorageEnabled {
-		i.mutex.RLock() // RLock should be sufficient if saveStateToFile doesn't modify
+		i.mutex.RLock()
 		err := i.saveStateToFile()
 		i.mutex.RUnlock()
 		if err != nil {
 			fmt.Printf("[%s] ERROR Failed to save final state on close: %v\n", i.name, err)
-			return err // Return the error if final save fails
+			return err
 		}
 		fmt.Printf("[%s] INFO Final state saved successfully.\n", i.name)
 	}
 	return nil
 }
 
-// --- Helper Functions ---
-
-// generateToken creates a secure token for an IP
+// --- Helper Functions --- (Remain the same as previous version)
 func (i *IPWhitelistShaper) generateToken(ip string) string {
 	h := hmac.New(sha256.New, []byte(i.config.SecretKey))
 	data := ip + fmt.Sprintf("%d", time.Now().UnixNano())
 	h.Write([]byte(data))
 	return hex.EncodeToString(h.Sum(nil)[:16])
 }
-
-// getRandomWord returns a random word for validation
 func (i *IPWhitelistShaper) getRandomWord() string {
 	r := rand.New(rand.NewSource(time.Now().UnixNano()))
 	if len(i.wordList) == 0 { return "approval" }
 	return i.wordList[r.Intn(len(i.wordList))]
 }
-
-// sendNotification sends a notification message to the configured URL
 func (i *IPWhitelistShaper) sendNotification(message string) {
 	if i.config.NotificationURL == "" { return }
 	go func(msg string, urlStr string, ctx context.Context, pluginName string) {
 		isDiscord := strings.Contains(strings.ToLower(urlStr), "discord.com/api/webhooks")
 		var reqBody *bytes.Buffer
 		contentType := "application/x-www-form-urlencoded"
-
 		if isDiscord {
 			payload := map[string]string{"content": msg}
 			jsonData, err := json.Marshal(payload)
@@ -716,34 +671,26 @@ func (i *IPWhitelistShaper) sendNotification(message string) {
 			values := url.Values{}; values.Set("message", msg)
 			reqBody = bytes.NewBufferString(values.Encode())
 		}
-
 		req, err := http.NewRequestWithContext(ctx, "POST", urlStr, reqBody)
 		if err != nil { fmt.Printf("[%s] ERROR creating notification request: %v\n", pluginName, err); return }
 		req.Header.Set("Content-Type", contentType)
 		req.Header.Set("User-Agent", "Traefik-IPWhitelistShaper-Plugin")
-
 		client := &http.Client{Timeout: 15 * time.Second}
 		resp, err := client.Do(req)
 		if err != nil {
-			if ctx.Err() == nil { // Only log if context wasn't cancelled
-				fmt.Printf("[%s] ERROR sending notification to %s: %v\n", pluginName, urlStr, err)
-			}
+			if ctx.Err() == nil { fmt.Printf("[%s] ERROR sending notification to %s: %v\n", pluginName, urlStr, err) }
 			return
 		}
 		defer resp.Body.Close()
-
 		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 			bodyBytes, _ := ioutil.ReadAll(resp.Body)
 			fmt.Printf("[%s] ERROR Notification webhook %s returned error (Status %d): %s\n", pluginName, urlStr, resp.StatusCode, string(bodyBytes))
 		}
 	}(message, i.config.NotificationURL, i.ctx, i.name)
 }
-
-// getClientIP extracts the client IP based on the chosen strategy
 func getClientIP(req *http.Request, depth int, excludedIPs []string) string {
 	remoteIP, _, err := net.SplitHostPort(req.RemoteAddr)
 	if err != nil { remoteIP = req.RemoteAddr }
-
 	if depth > 0 {
 		xff := req.Header.Get("X-Forwarded-For")
 		if xff != "" {
@@ -753,7 +700,6 @@ func getClientIP(req *http.Request, depth int, excludedIPs []string) string {
 				trimmedIP := strings.TrimSpace(ipStr)
 				if net.ParseIP(trimmedIP) != nil { processedIPs = append(processedIPs, trimmedIP) }
 			}
-
 			if len(excludedIPs) > 0 {
 				checker, err := newSourceRangeChecker(excludedIPs)
 				if err == nil {
@@ -762,27 +708,17 @@ func getClientIP(req *http.Request, depth int, excludedIPs []string) string {
 					if len(filtered) > 0 { processedIPs = filtered }
 				} else { fmt.Printf("[ipwhitelistshaper] Warning: Could not parse excludedIPs for filtering: %v\n", err) }
 			}
-
-			if len(processedIPs) >= depth {
-				targetIndex := len(processedIPs) - depth
-				return processedIPs[targetIndex]
-			} else if len(processedIPs) > 0 {
-				return processedIPs[0]
-			}
+			if len(processedIPs) >= depth { targetIndex := len(processedIPs) - depth; return processedIPs[targetIndex] } else if len(processedIPs) > 0 { return processedIPs[0] }
 		}
 	}
 	return remoteIP
 }
-
-// getScheme determines the scheme (http/https) from the request
 func getScheme(req *http.Request) string {
 	if req.TLS != nil { return "https" }
 	if scheme := req.Header.Get("X-Forwarded-Proto"); scheme != "" { return scheme }
 	if scheme := req.Header.Get("X-Scheme"); scheme != "" { return scheme }
 	return "http"
 }
-
-// newSourceRangeChecker creates a new checker for IP source ranges
 func newSourceRangeChecker(sourceRanges []string) (*sourceRangeChecker, error) {
 	checker := &sourceRangeChecker{ ranges: make([]net.IPNet, 0, len(sourceRanges)) }
 	for _, cidr := range sourceRanges {
@@ -801,20 +737,16 @@ func newSourceRangeChecker(sourceRanges []string) (*sourceRangeChecker, error) {
 	}
 	return checker, nil
 }
-
-// contains checks if an IP is in any of the configured ranges
 func (s *sourceRangeChecker) contains(ipStr string) bool {
 	ip := net.ParseIP(ipStr)
 	if ip == nil { return false }
 	for _, ipNet := range s.ranges { if ipNet.Contains(ip) { return true } }
 	return false
 }
-
-// generateRandomKey creates a random key for HMAC
 func generateRandomKey() string {
 	r := rand.New(rand.NewSource(time.Now().UnixNano()))
 	bytes := make([]byte, 32)
 	_, err := r.Read(bytes)
-	if err != nil { for i := range bytes { bytes[i] = byte(r.Intn(256)) } } // Fallback
+	if err != nil { for i := range bytes { bytes[i] = byte(r.Intn(256)) } }
 	return hex.EncodeToString(bytes)
 }
