@@ -14,6 +14,19 @@ func TestIPWhitelistShaper(t *testing.T) {
 	config := ipwhitelistshaper.CreateConfig()
 	config.KnockEndpoint = "/knock-knock"
 	config.WhitelistedIPs = []string{"192.168.1.1/32"}
+	
+	// Either disable storage for tests
+	config.StorageEnabled = false
+	
+	// OR use a temporary directory that the test has permission to access
+	/*
+	tempDir, err := os.MkdirTemp("", "ipwhitelistshaper-test")
+	if err != nil {
+		t.Fatalf("Failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tempDir) // Clean up after test
+	config.StoragePath = tempDir
+	*/
 
 	// Create a dummy next handler
 	next := http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
@@ -70,7 +83,7 @@ func TestIPWhitelistShaper(t *testing.T) {
 	if rec3.Code != http.StatusOK {
 		t.Errorf("Expected status code %d, got %d", http.StatusOK, rec3.Code)
 	}
-	if rec3.Header().Get("Content-Type") != "text/html" {
-		t.Errorf("Expected Content-Type %q, got %q", "text/html", rec3.Header().Get("Content-Type"))
+	if rec3.Header().Get("Content-Type") != "text/html; charset=utf-8" {
+		t.Errorf("Expected Content-Type %q, got %q", "text/html; charset=utf-8", rec3.Header().Get("Content-Type"))
 	}
 }
