@@ -14,6 +14,8 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -30,12 +32,25 @@ type Config struct {
 	NotificationURL            string   `json:"notificationURL,omitempty"`
 	KnockEndpoint              string   `json:"knockEndpoint,omitempty"`
 	ApprovalURL                string   `json:"approvalURL,omitempty"`
+	
+	// File storage configuration
+	StorageEnabled bool   `json:"storageEnabled,omitempty"`
+	StoragePath    string `json:"storagePath,omitempty"`
+	SaveInterval   int    `json:"saveInterval,omitempty"` // In seconds
+}
+
+// StoredState represents the data that will be saved to disk
+type StoredState struct {
+	WhitelistedIPs   map[string]IPData `json:"whitelistedIPs"`
+	PendingApprovals map[string]IPData `json:"pendingApprovals"`
+	LastRequestedIP  map[string]string `json:"lastRequestedIP"` // Store as string for JSON compatibility
 }
 
 // IPData stores information about whitelisted IPs
 type IPData struct {
 	ExpiresAt    time.Time `json:"expiresAt"`
 	ValidationID string    `json:"validationId"`
+	ValidationCode string    `json:"validationCode"` // New field
 }
 
 // CreateConfig creates a default plugin configuration.
@@ -49,6 +64,11 @@ func CreateConfig() *Config {
 		SecretKey:                  generateRandomKey(),
 		KnockEndpoint:              "/knock-knock",
 		ApprovalURL:                "",
+		
+		// Default file storage configuration
+		StorageEnabled: true,
+		StoragePath:    "/plugins-storage/ipwhitelistshaper",
+		SaveInterval:   30, // Save every 30 seconds by default
 	}
 }
 
@@ -64,6 +84,7 @@ type IPWhitelistShaper struct {
 	mutex              sync.RWMutex
 	wordList           []string
 	ctx                context.Context
+	stopChan           chan struct{} // Channel to stop background saving
 }
 
 type sourceRangeChecker struct {
@@ -111,6 +132,25 @@ func New(ctx context.Context, next http.Handler, config *Config, name string) (h
 		sourceRangeChecker: checker,
 		wordList:           wordList,
 		ctx:                ctx,
+		stopChan:           make(chan struct{}),
+	}
+	
+	// Initialize storage directory if enabled
+	if config.StorageEnabled {
+		err := os.MkdirAll(config.StoragePath, 0755)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create storage directory: %v", err)
+		}
+		
+		// Load initial state from file
+		err = middleware.loadState()
+		if err != nil {
+			// Log error but continue - this might be the first run
+			fmt.Printf("Warning: Could not load initial state: %v\n", err)
+		}
+		
+		// Start background saving
+		go middleware.periodicStateSaving()
 	}
 	
 	return middleware, nil
@@ -155,6 +195,11 @@ func (i *IPWhitelistShaper) ServeHTTP(rw http.ResponseWriter, req *http.Request)
 			delete(i.whitelistedIPs, clientIP)
 			i.mutex.Unlock()
 
+			// Save state after modifying it
+			if i.config.StorageEnabled {
+				go i.saveState()
+			}
+
 			// Send notification about expiration
 			msg := fmt.Sprintf("❌ Removed %s from whitelist. Access revoked.", clientIP)
 			i.sendNotification(msg)
@@ -196,11 +241,16 @@ func (i *IPWhitelistShaper) handleKnockRequest(rw http.ResponseWriter, req *http
 
 	// Set expiration time
 	expiration := time.Now().Add(time.Duration(i.config.ExpirationTime) * time.Second)
-
+    fmt.Printf("DEBUG: Storing token %s for IP %s\n", token, clientIP) // Add debugging
 	// Store pending approval
 	i.pendingApprovals[clientIP] = IPData{
 		ExpiresAt:    expiration,
 		ValidationID: token,
+	}
+    fmt.Printf("DEBUG: Current pending approvals: %+v\n", i.pendingApprovals)
+	// Save state after modifying it
+	if i.config.StorageEnabled {
+		go i.saveState()
 	}
 
 	// Construct approval link
@@ -271,30 +321,57 @@ func (i *IPWhitelistShaper) handleKnockRequest(rw http.ResponseWriter, req *http
 
 // handleApproveRequest processes approval requests
 func (i *IPWhitelistShaper) handleApproveRequest(rw http.ResponseWriter, req *http.Request) {
-	// Parse query parameters
-	ip := req.URL.Query().Get("ip")
-	token := req.URL.Query().Get("token")
-	expirationStr := req.URL.Query().Get("expiration")
-	// validationCode := req.URL.Query().Get("validationCode") // Not used but included for UI
+	rawIP := req.URL.Query().Get("ip")
+	rawToken := req.URL.Query().Get("token")
+	fmt.Printf("DEBUG: Received approval request for IP: %s, Token: %s\n", rawIP, rawToken)
+    // Get encoded parameters from URL
+    ipEncoded := req.URL.Query().Get("ip")
+    tokenEncoded := req.URL.Query().Get("token")
+    validationCodeEncoded := req.URL.Query().Get("validationCode") 
+    expirationStr := req.URL.Query().Get("expiration")
 
-	// Validate parameters
-	if ip == "" || token == "" {
-		rw.WriteHeader(http.StatusBadRequest)
-		rw.Write([]byte("Invalid request parameters"))
-		return
-	}
+    // Decode URL parameters
+    ip, err1 := url.QueryUnescape(ipEncoded)
+    token, err2 := url.QueryUnescape(tokenEncoded)
+    validationCode, err3 := url.QueryUnescape(validationCodeEncoded)
 
-	// Lock for modifications
-	i.mutex.Lock()
-	defer i.mutex.Unlock()
+    // Handle decoding errors (optional but recommended)
+    if err1 != nil || err2 != nil || err3 != nil {
+        rw.WriteHeader(http.StatusBadRequest)
+        rw.Write([]byte("Error decoding URL parameters"))
+        return
+    }
 
-	// Check if IP and token match
-	pendingData, exists := i.pendingApprovals[ip]
-	if !exists || pendingData.ValidationID != token {
-		rw.WriteHeader(http.StatusForbidden)
-		rw.Write([]byte("Invalid token or IP address"))
-		return
-	}
+    // Validate parameters
+    if ip == "" || token == "" {
+        rw.WriteHeader(http.StatusBadRequest)
+        rw.Write([]byte("Invalid request parameters"))
+        return
+    }
+
+    // For validationCode - either use it for validation or use the blank identifier
+    // Option 1: Use it for validation
+    // The rest of your function using the decoded variables...
+    
+    // Lock for modifications
+    i.mutex.Lock()
+    defer i.mutex.Unlock()
+
+    // Check if IP and token match
+    pendingData, exists := i.pendingApprovals[ip]
+    if !exists || pendingData.ValidationID != token {
+        rw.WriteHeader(http.StatusForbidden)
+        rw.Write([]byte("Invalid token or IP address"))
+        return
+    }
+
+    // Optional: Validate the validation code if needed
+    // If ValidationCode is stored in your IPData struct
+    if pendingData.ValidationCode != validationCode {
+        rw.WriteHeader(http.StatusForbidden)
+        rw.Write([]byte("Invalid validation code"))
+        return
+    }
 
 	// Parse expiration time
 	expirationTime := i.config.ExpirationTime
@@ -313,6 +390,11 @@ func (i *IPWhitelistShaper) handleApproveRequest(rw http.ResponseWriter, req *ht
 
 	// Remove from pending approvals
 	delete(i.pendingApprovals, ip)
+
+	// Save state after modifying it
+	if i.config.StorageEnabled {
+		go i.saveState()
+	}
 
 	// Send notification
 	message := fmt.Sprintf("✅ Whitelisted %s for %d seconds", ip, expirationTime)
@@ -369,6 +451,155 @@ func (i *IPWhitelistShaper) handleApproveRequest(rw http.ResponseWriter, req *ht
 
 	rw.Header().Set("Content-Type", "text/html")
 	rw.Write([]byte(html))
+}
+
+// periodicStateSaving runs a background goroutine to periodically save state
+func (i *IPWhitelistShaper) periodicStateSaving() {
+	ticker := time.NewTicker(time.Duration(i.config.SaveInterval) * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			i.saveState()
+		case <-i.stopChan:
+			return
+		}
+	}
+}
+
+// saveState saves the current state to disk
+func (i *IPWhitelistShaper) saveState() error {
+	if !i.config.StorageEnabled {
+		return nil
+	}
+
+	i.mutex.RLock()
+	defer i.mutex.RUnlock()
+	
+	// Create a copy of the current state
+	state := StoredState{
+		WhitelistedIPs:   make(map[string]IPData),
+		PendingApprovals: make(map[string]IPData),
+		LastRequestedIP:  make(map[string]string),
+	}
+	
+	// Copy whitelisted IPs
+	for ip, data := range i.whitelistedIPs {
+		// Skip expired entries
+		if time.Now().After(data.ExpiresAt) {
+			continue
+		}
+		state.WhitelistedIPs[ip] = data
+	}
+	
+	// Copy pending approvals
+	for ip, data := range i.pendingApprovals {
+		// Skip expired entries
+		if time.Now().After(data.ExpiresAt) {
+			continue
+		}
+		state.PendingApprovals[ip] = data
+	}
+	
+	// Copy last requested times
+	for ip, lastTime := range i.lastRequestedIP {
+		state.LastRequestedIP[ip] = lastTime.Format(time.RFC3339)
+	}
+	
+	// Marshal to JSON
+	data, err := json.Marshal(state)
+	if err != nil {
+		return fmt.Errorf("failed to marshal state: %v", err)
+	}
+	
+	// Write to a temporary file first
+	tempFile := filepath.Join(i.config.StoragePath, "state.json.tmp")
+	err = ioutil.WriteFile(tempFile, data, 0644)
+	if err != nil {
+		return fmt.Errorf("failed to write temporary state file: %v", err)
+	}
+	
+	// Atomically replace the old file
+	stateFile := filepath.Join(i.config.StoragePath, "state.json")
+	err = os.Rename(tempFile, stateFile)
+	if err != nil {
+		return fmt.Errorf("failed to rename temporary state file: %v", err)
+	}
+	
+	return nil
+}
+
+// loadState loads the state from disk
+func (i *IPWhitelistShaper) loadState() error {
+	if !i.config.StorageEnabled {
+		return nil
+	}
+	
+	stateFile := filepath.Join(i.config.StoragePath, "state.json")
+	
+	// Check if file exists
+	if _, err := os.Stat(stateFile); os.IsNotExist(err) {
+		return nil // Not an error, just no state yet
+	}
+	
+	// Read file
+	data, err := ioutil.ReadFile(stateFile)
+	if err != nil {
+		return fmt.Errorf("failed to read state file: %v", err)
+	}
+	
+	// Unmarshal from JSON
+	var state StoredState
+	err = json.Unmarshal(data, &state)
+	if err != nil {
+		return fmt.Errorf("failed to unmarshal state: %v", err)
+	}
+	
+	i.mutex.Lock()
+	defer i.mutex.Unlock()
+	
+	// Restore whitelisted IPs
+	for ip, data := range state.WhitelistedIPs {
+		// Skip expired entries
+		if time.Now().After(data.ExpiresAt) {
+			continue
+		}
+		i.whitelistedIPs[ip] = data
+	}
+	
+	// Restore pending approvals
+	for ip, data := range state.PendingApprovals {
+		// Skip expired entries
+		if time.Now().After(data.ExpiresAt) {
+			continue
+		}
+		i.pendingApprovals[ip] = data
+	}
+	
+	// Restore last requested times
+	for ip, timeStr := range state.LastRequestedIP {
+		lastTime, err := time.Parse(time.RFC3339, timeStr)
+		if err != nil {
+			continue // Skip this entry if we can't parse the time
+		}
+		i.lastRequestedIP[ip] = lastTime
+	}
+	
+	return nil
+}
+
+// Close cleans up resources and ensures state is saved
+func (i *IPWhitelistShaper) Close() error {
+	// Signal the background saving goroutine to stop
+	close(i.stopChan)
+	
+	// Save state one last time
+	if i.config.StorageEnabled {
+		return i.saveState()
+	}
+	
+	return nil
 }
 
 // generateToken creates a secure token for an IP
