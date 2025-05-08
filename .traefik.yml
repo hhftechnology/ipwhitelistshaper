@@ -1,6 +1,6 @@
 displayName: IP Whitelist Shaper
 type: middleware
-import: github.com/yourusername/ipwhitelistshaper
+import: github.com/hhftechnology/ipwhitelistshaper
 summary: Dynamic IP whitelist manager with approval flow for Traefik
 
 testData:
