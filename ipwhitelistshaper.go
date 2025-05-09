@@ -38,6 +38,9 @@ type Config struct {
 	StorageEnabled bool   `json:"storageEnabled,omitempty"`
 	StoragePath    string `json:"storagePath,omitempty"`
 	SaveInterval   int    `json:"saveInterval,omitempty"` // In seconds
+	
+	// Internal flag (not exposed to config)
+	storageReadOnly bool   // Flag to indicate read-only storage mode
 }
 
 // StoredState represents the data that will be saved to disk
@@ -70,6 +73,7 @@ func CreateConfig() *Config {
 		StorageEnabled: true,
 		StoragePath:    "/plugins-storage/ipwhitelistshaper",
 		SaveInterval:   30, // Default every 30 seconds
+		storageReadOnly: false,
 	}
 }
 
@@ -142,21 +146,50 @@ func New(ctx context.Context, next http.Handler, config *Config, name string) (h
 		stopChan:           make(chan struct{}),
 	}
 
+	// Handle storage setup with graceful fallback
 	if config.StorageEnabled {
-		if err := os.MkdirAll(config.StoragePath, 0755); err != nil {
-			cancel() // Cancel context if setup fails
-			return nil, fmt.Errorf("failed to create storage directory '%s': %v", config.StoragePath, err)
+		// Try to create the storage directory
+		err := os.MkdirAll(config.StoragePath, 0755)
+		if err != nil {
+			// Check if directory exists but is just not writable
+			if info, statErr := os.Stat(config.StoragePath); statErr == nil && info.IsDir() {
+				// Directory exists but might be read-only
+				fmt.Printf("[%s] WARNING: Storage directory exists but may not be writable: %v\n", name, err)
+				config.storageReadOnly = true
+			} else {
+				// Try using a temporary directory instead
+				tempDir := os.TempDir()
+				tempStoragePath := filepath.Join(tempDir, "ipwhitelistshaper-"+name)
+				fmt.Printf("[%s] WARNING: Cannot use configured storage path. Using temporary directory for storage: %s\n", 
+					name, tempStoragePath)
+				config.StoragePath = tempStoragePath
+				
+				// Try creating the temp directory
+				if err := os.MkdirAll(config.StoragePath, 0755); err != nil {
+					fmt.Printf("[%s] WARNING: Cannot create storage directory: %v. Operating in memory-only mode.\n", name, err)
+					// Operate in memory-only mode, but still try to load existing data
+					config.storageReadOnly = true
+				}
+			}
 		}
+
+		// Try to load state regardless of write permissions
 		if err = middleware.loadState(); err != nil && !os.IsNotExist(err) {
-			fmt.Printf("[%s] Warning: Could not load initial state from %s: %v\n", name, config.StoragePath, err)
+			fmt.Printf("[%s] WARNING: Could not load initial state from %s: %v\n", name, config.StoragePath, err)
 		} else if err == nil {
 			fmt.Printf("[%s] INFO Initial state loaded successfully from %s.\n", name, config.StoragePath)
 		}
-		// --- Temporarily disable background tasks for testing ---
-		// go middleware.periodicStateSaving()
-		// go middleware.cleanupExpiredEntries()
-		fmt.Printf("[%s] WARNING: Periodic saving and cleanup are temporarily disabled for debugging.\n", name)
-		// --------------------------------------------------------
+
+		// Only start background tasks if we have write permissions
+		if !config.storageReadOnly {
+			go middleware.periodicStateSaving()
+			go middleware.cleanupExpiredEntries()
+			fmt.Printf("[%s] INFO Started background tasks for state management.\n", name)
+		} else {
+			fmt.Printf("[%s] WARNING: Storage is in read-only mode. State will not be persisted.\n", name)
+		}
+	} else {
+		fmt.Printf("[%s] INFO Storage is disabled. Operating in memory-only mode.\n", name)
 	}
 
 	return middleware, nil
@@ -220,9 +253,9 @@ func (i *IPWhitelistShaper) handleKnockRequest(rw http.ResponseWriter, req *http
 		i.lastRequestedIP[clientIP] = time.Now()
 		validationCode := pendingData.ValidationCode
 		i.mutex.Unlock()
-		if i.config.StorageEnabled {
+		if i.config.StorageEnabled && !i.config.storageReadOnly {
 			if err := i.saveState(); err != nil { // Sync save lastRequestedIP update
-				fmt.Printf("[%s] ERROR saving state during knock re-request: %v\n", i.name, err)
+				fmt.Printf("[%s] WARNING: Could not save state during knock re-request: %v\n", i.name, err)
 			}
 		}
 		i.serveKnockPage(rw, validationCode, "An approval request is already pending. Please use the validation code below.")
@@ -242,9 +275,10 @@ func (i *IPWhitelistShaper) handleKnockRequest(rw http.ResponseWriter, req *http
 
 	i.mutex.Unlock() // Unlock before synchronous save
 
-	if i.config.StorageEnabled {
+	// Only try to save if storage is enabled and writable
+	if i.config.StorageEnabled && !i.config.storageReadOnly {
 		if err := i.saveState(); err != nil { // Synchronous save
-			fmt.Printf("[%s] ERROR saving state after creating pending approval: %v\n", i.name, err)
+			fmt.Printf("[%s] WARNING: Could not save state after creating pending approval: %v\n", i.name, err)
 		} else {
 			fmt.Printf("[%s] INFO State saved synchronously for pending approval IP: %s\n", i.name, clientIP)
 		}
@@ -320,23 +354,67 @@ func (i *IPWhitelistShaper) handleApproveRequest(rw http.ResponseWriter, req *ht
 	i.mutex.Lock()
 	defer i.mutex.Unlock()
 
-	// *** Explicitly load state from file *within* the lock ***
+	// Try to reload state, but don't fail if it doesn't work
 	if i.config.StorageEnabled {
-		err := i.loadStateFromFile() // Use internal load method that assumes lock is held
-		if err != nil && !os.IsNotExist(err) {
-			fmt.Printf("[%s] ERROR Failed to reload state before processing approval for IP %s: %v\n", i.name, ip, err)
-			http.Error(rw, "Internal server error: Failed to load state", http.StatusInternalServerError)
-			return
-		}
-		// *** ADDED LOGGING: Log the state *after* loading ***
-		fmt.Printf("[%s] DEBUG State loaded in handleApproveRequest for IP %s. Current pending map size: %d. Content: %+v\n", i.name, ip, len(i.pendingApprovals), i.pendingApprovals)
+		// Try to reload, but ignore errors
+		_ = i.loadStateFromFile()
+		// Log debugging info
+		fmt.Printf("[%s] DEBUG State loaded in handleApproveRequest for IP %s. Current pending map size: %d. Content samples: %+v\n", 
+			i.name, ip, len(i.pendingApprovals), maskDebugData(i.pendingApprovals))
 	}
 
 	// Check if IP and token match the *now loaded* pending approval data
 	pendingData, exists := i.pendingApprovals[ip]
 	if !exists {
-		// *** ADDED LOGGING: More context if not found ***
-		fmt.Printf("[%s] ERROR No pending approval found in current state for IP: %s (Token: %s). Approval attempt failed.\n", i.name, ip, token)
+		// NEW CODE: Check if the IP is already whitelisted
+		if whitelistData, isWhitelisted := i.whitelistedIPs[ip]; isWhitelisted {
+			// IP is already approved, show success page but don't send notification again
+			fmt.Printf("[%s] INFO IP %s is already whitelisted, expires at %s\n", 
+				i.name, ip, whitelistData.ExpiresAt.Format(time.RFC3339))
+			
+			// Calculate remaining time
+			remainingTime := int(time.Until(whitelistData.ExpiresAt).Seconds())
+			if remainingTime < 0 {
+				remainingTime = 0
+			}
+			
+			// Show success page with already whitelisted message
+			html := fmt.Sprintf(`
+				<!DOCTYPE html>
+				<html lang="en">
+				<head>
+					<meta charset="UTF-8">
+					<meta name="viewport" content="width=device-width, initial-scale=1.0">
+					<title>Already Approved</title>
+					<style>
+						body { font-family: system-ui, sans-serif; background-color: #f0f8f0; color: #333; padding: 20px; display: flex; justify-content: center; align-items: center; min-height: 100vh; }
+						.container { max-width: 500px; width: 100%%; background-color: #fff; border-radius: 8px; padding: 30px; box-shadow: 0 4px 15px rgba(0, 0, 0, 0.1); text-align: center; }
+						h1 { color: #2e7d32; margin-bottom: 15px; }
+						p { color: #555; margin-bottom: 25px; line-height: 1.6; }
+						.success { color: #2e7d32; font-weight: bold; font-size: 1.1em; }
+						.ip-address { font-family: monospace; background-color: #e8f5e9; padding: 3px 6px; border-radius: 4px; }
+						.expiration { font-style: italic; color: #777; margin-top: 15px; }
+					</style>
+				</head>
+				<body>
+					<div class="container">
+						<h1>Already Approved</h1>
+						<p><span class="success">IP address <span class="ip-address">%s</span> is already whitelisted.</span></p>
+						<p class="expiration">Access will expire in %d seconds.</p>
+					</div>
+				</body>
+				</html>
+			`, ip, remainingTime)
+			
+			rw.Header().Set("Content-Type", "text/html; charset=utf-8")
+			rw.WriteHeader(http.StatusOK)
+			rw.Write([]byte(html))
+			return
+		}
+		
+		// Original error message for IP not found in either list
+		fmt.Printf("[%s] ERROR No pending approval found in current state for IP: %s (Token: %s). Approval attempt failed. Pending map keys: %v\n", 
+			i.name, ip, token, getMapKeys(i.pendingApprovals))
 		http.Error(rw, "Invalid token or IP address: No pending approval found", http.StatusForbidden)
 		return
 	}
@@ -370,10 +448,10 @@ func (i *IPWhitelistShaper) handleApproveRequest(rw http.ResponseWriter, req *ht
 	}
 	delete(i.pendingApprovals, ip) // Remove from pending
 
-	// Save state synchronously within the lock
-	if i.config.StorageEnabled {
+	// Try to save state, but don't fail if it doesn't work
+	if i.config.StorageEnabled && !i.config.storageReadOnly {
 		if err := i.saveStateToFile(); err != nil {
-			fmt.Printf("[%s] ERROR saving state after approval (within lock): %v\n", i.name, err)
+			fmt.Printf("[%s] WARNING: Could not save state after approval: %v\n", i.name, err)
 		} else {
 			fmt.Printf("[%s] INFO State saved synchronously after approval for IP %s.\n", i.name, ip)
 		}
@@ -416,10 +494,42 @@ func (i *IPWhitelistShaper) handleApproveRequest(rw http.ResponseWriter, req *ht
 	rw.WriteHeader(http.StatusOK)
 	rw.Write([]byte(html))
 }
+// Helper function for debug logging
+func maskDebugData(data map[string]IPData) map[string]string {
+	result := make(map[string]string)
+	count := 0
+	for k, v := range data {
+		if count < 3 { // Only show up to 3 sample entries
+			result[k] = fmt.Sprintf("ValidID: %s..., ValidCode: %s, Expires: %s", 
+				truncateString(v.ValidationID, 8), 
+				v.ValidationCode, 
+				v.ExpiresAt.Format(time.RFC3339))
+			count++
+		}
+	}
+	return result
+}
+
+// Helper function to truncate strings for logging
+func truncateString(s string, maxLen int) string {
+	if len(s) <= maxLen {
+		return s
+	}
+	return s[:maxLen]
+}
+
+// Helper function to get map keys for debugging
+func getMapKeys(m map[string]IPData) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	return keys
+}
 
 // periodicStateSaving runs a background goroutine to periodically save state
 func (i *IPWhitelistShaper) periodicStateSaving() {
-	if !i.config.StorageEnabled || i.config.SaveInterval <= 0 {
+	if !i.config.StorageEnabled || i.config.SaveInterval <= 0 || i.config.storageReadOnly {
 		return
 	}
 	ticker := time.NewTicker(time.Duration(i.config.SaveInterval) * time.Second)
@@ -432,7 +542,7 @@ func (i *IPWhitelistShaper) periodicStateSaving() {
 			err := i.saveStateToFile()
 			i.mutex.RUnlock()
 			if err != nil {
-				fmt.Printf("[%s] ERROR periodic state saving failed: %v\n", i.name, err)
+				fmt.Printf("[%s] WARNING: Periodic state saving failed: %v\n", i.name, err)
 			}
 		case <-i.stopChan:
 			return
@@ -486,10 +596,10 @@ func (i *IPWhitelistShaper) cleanupExpiredEntries() {
 			}
 			i.mutex.Unlock()
 
-			if needsSave && i.config.StorageEnabled {
+			if needsSave && i.config.StorageEnabled && !i.config.storageReadOnly {
 				go func() { // Save in background
 					if err := i.saveState(); err != nil {
-						fmt.Printf("[%s] ERROR saving state after cleanup: %v\n", i.name, err)
+						fmt.Printf("[%s] WARNING: Could not save state after cleanup: %v\n", i.name, err)
 					}
 				}()
 			}
@@ -504,7 +614,7 @@ func (i *IPWhitelistShaper) cleanupExpiredEntries() {
 
 // saveState acquires lock and calls saveStateToFile
 func (i *IPWhitelistShaper) saveState() error {
-	if !i.config.StorageEnabled {
+	if !i.config.StorageEnabled || i.config.storageReadOnly {
 		return nil
 	}
 	i.mutex.RLock()
@@ -514,6 +624,11 @@ func (i *IPWhitelistShaper) saveState() error {
 
 // saveStateToFile performs the actual saving logic, assumes RLock is held
 func (i *IPWhitelistShaper) saveStateToFile() error {
+	// Skip saving if storage is read-only
+	if i.config.storageReadOnly {
+		return nil
+	}
+
 	state := StoredState{
 		WhitelistedIPs:   make(map[string]IPData),
 		PendingApprovals: make(map[string]IPData),
@@ -521,8 +636,8 @@ func (i *IPWhitelistShaper) saveStateToFile() error {
 	}
 	now := time.Now()
 
-	// *** ADDED LOGGING: Log pending approvals being saved ***
-	fmt.Printf("[%s] DEBUG Saving state. Pending approvals to save: %+v\n", i.name, i.pendingApprovals)
+	// Log debugging info about pending approvals
+	fmt.Printf("[%s] DEBUG Saving state. Pending approvals to save: %d entries\n", i.name, len(i.pendingApprovals))
 
 	for ip, data := range i.whitelistedIPs {
 		if now.Before(data.ExpiresAt) {
@@ -566,7 +681,12 @@ func (i *IPWhitelistShaper) loadState() error {
 	}
 	i.mutex.Lock()
 	defer i.mutex.Unlock()
-	return i.loadStateFromFile()
+	
+	err := i.loadStateFromFile()
+	if err != nil && !os.IsNotExist(err) {
+		fmt.Printf("[%s] WARNING: Could not load state: %v\n", i.name, err)
+	}
+	return nil
 }
 
 // loadStateFromFile performs the actual loading logic, assumes Lock is held
@@ -618,8 +738,9 @@ func (i *IPWhitelistShaper) loadStateFromFile() error {
 	i.pendingApprovals = tempPendingApprovals
 	i.lastRequestedIP = tempLastRequestedIP
 
-	// *** ADDED LOGGING: Log state after loading from file ***
-	fmt.Printf("[%s] DEBUG State loaded from file %s. Pending approvals map size: %d. Content: %+v\n", i.name, stateFile, len(i.pendingApprovals), i.pendingApprovals)
+	// Log debug info after loading from file
+	fmt.Printf("[%s] DEBUG State loaded from file %s. Pending approvals map size: %d.\n", 
+		i.name, stateFile, len(i.pendingApprovals))
 	return nil
 }
 
@@ -628,20 +749,20 @@ func (i *IPWhitelistShaper) Close() error {
 	fmt.Printf("[%s] INFO Shutting down IPWhitelistShaper middleware.\n", i.name)
 	i.cancel()
 	close(i.stopChan)
-	if i.config.StorageEnabled {
+	if i.config.StorageEnabled && !i.config.storageReadOnly {
 		i.mutex.RLock()
 		err := i.saveStateToFile()
 		i.mutex.RUnlock()
 		if err != nil {
-			fmt.Printf("[%s] ERROR Failed to save final state on close: %v\n", i.name, err)
-			return err
+			fmt.Printf("[%s] WARNING: Could not save final state on close: %v\n", i.name, err)
+		} else {
+			fmt.Printf("[%s] INFO Final state saved successfully.\n", i.name)
 		}
-		fmt.Printf("[%s] INFO Final state saved successfully.\n", i.name)
 	}
 	return nil
 }
 
-// --- Helper Functions --- (Remain the same as previous version)
+// --- Helper Functions --- (Remain the same as previous version with minor updates)
 func (i *IPWhitelistShaper) generateToken(ip string) string {
 	h := hmac.New(sha256.New, []byte(i.config.SecretKey))
 	data := ip + fmt.Sprintf("%d", time.Now().UnixNano())
