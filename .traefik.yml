@@ -1,5 +1,7 @@
 displayName: IP Whitelist Shaper
 type: middleware
+iconPath: ./assets/icon.png
+bannerPath: ./assets/banner.png
 import: github.com/hhftechnology/ipwhitelistshaper
 summary: Dynamic IP whitelist manager with approval flow for Traefik
 
