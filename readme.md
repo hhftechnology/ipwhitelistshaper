@@ -271,7 +271,8 @@ experimental:
       - ./traefik/plugins-storage:/plugins-local:rw
       - ./config/traefik/rules:/rules
 ```
-
+>[!Tip]
+> I just loved the creation by l4rm4nd and i build a Traefik plugin around this idea. Original idea check it out [here](https://github.com/l4rm4nd/TraefikShaper/).
 
 ## Troubleshooting
 
