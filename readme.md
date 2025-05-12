@@ -1,4 +1,14 @@
-# Traefik IP Whitelist Shaper
+<div align="center" width="100%">
+    <h1>Traefik IP Whitelist Shaper</h1>
+    <img width="auto" src="assets/banner.png">
+    <a target="_blank" href="https://GitHub.com/hhftechnology/ipwhitelistshaper/graphs/contributors/"><img src="https://img.shields.io/github/contributors/hhftechnology/ipwhitelistshaper.svg" /></a><br>
+    <a target="_blank" href="https://GitHub.com/hhftechnology/ipwhitelistshaper/commits/"><img src="https://img.shields.io/github/last-commit/hhftechnology/ipwhitelistshaper.svg" /></a>
+    <a target="_blank" href="https://GitHub.com/hhftechnology/ipwhitelistshaper/issues/"><img src="https://img.shields.io/github/issues/hhftechnology/ipwhitelistshaper.svg" /></a>
+    <a target="_blank" href="https://github.com/hhftechnology/ipwhitelistshaper/issues?q=is%3Aissue+is%3Aclosed"><img src="https://img.shields.io/github/issues-closed/hhftechnology/ipwhitelistshaper.svg" /></a><br>
+        <a target="_blank" href="https://github.com/hhftechnology/ipwhitelistshaper/stargazers"><img src="https://img.shields.io/github/stars/hhftechnology/ipwhitelistshaper.svg?style=social&label=Star" /></a>
+    <a target="_blank" href="https://github.com/hhftechnology/ipwhitelistshaper/network/members"><img src="https://img.shields.io/github/forks/hhftechnology/ipwhitelistshaper.svg?style=social&label=Fork" /></a>
+    <a target="_blank" href="https://github.com/hhftechnology/ipwhitelistshaper/watchers"><img src="https://img.shields.io/github/watchers/hhftechnology/ipwhitelistshaper.svg?style=social&label=Watch" /></a><br>
+</div>
 
 <div align="center" width="100%">
     <p>A Traefik middleware plugin for dynamic IP whitelisting with administrator approval flow</p>
