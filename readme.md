@@ -15,6 +15,10 @@
     <a target="_blank" href="https://github.com/hhftechnology/ipwhitelistshaper"><img src="https://img.shields.io/badge/maintainer-hhftechnology-orange" /></a>
 </div>
 
+## 📝 Forums
+
+[See the forums for further discussion here](https://forum.hhf.technology/)
+
 ## How It Works
 
 This Traefik plugin provides a dynamic IP whitelisting mechanism with an admin approval flow. When a user tries to access a protected service and is not in the whitelist, they can request temporary access through a special endpoint. An administrator receives a notification with an approval link that can whitelist the user's IP for a configurable amount of time.
