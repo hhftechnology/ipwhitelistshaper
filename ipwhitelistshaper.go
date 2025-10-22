@@ -783,6 +783,7 @@ func (i *IPWhitelistShaper) sendNotification(message string) {
 		loweredURL := strings.ToLower(urlStr)
 		isDiscord := strings.Contains(loweredURL, "discord.com/api/webhooks")
 		isSlack := strings.Contains(loweredURL, "hooks.slack.com/services")
+		isTelegram := strings.Contains(loweredURL, "api.telegram.org/bot")
 
 		var reqBody *bytes.Buffer
 		contentType := "application/x-www-form-urlencoded"
@@ -808,6 +809,21 @@ func (i *IPWhitelistShaper) sendNotification(message string) {
 			values := url.Values{}
 			values.Set("payload", string(jsonData))
 			reqBody = bytes.NewBufferString(values.Encode())
+
+		case isTelegram:
+			payload := map[string]interface{}{
+				"text": msg,
+				"link_preview_options": map[string]bool{
+					"is_disabled": true,
+				},
+			}
+			jsonData, err := json.Marshal(payload)
+			if err != nil {
+				fmt.Printf("[%s] ERROR creating Telegram payload: %v\n", pluginName, err)
+				return
+			}
+			reqBody = bytes.NewBuffer(jsonData)
+			contentType = "application/json"
 
 		default:
 			values := url.Values{}

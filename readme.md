@@ -192,6 +192,21 @@ ipwhitelistshaper:
 
 The plugin automatically detects Discord webhook URLs and formats messages appropriately.
 
+### Telegram Webhook Integration
+
+To use Telegram for notifications:
+
+1. Create a telegram bot and retrieve the api token
+2. Find the chat_id of the chat to use
+3. Add it to your configuration:
+
+```yaml
+ipwhitelistshaper:
+  notificationURL: "https://api.telegram.org/bot<token>?chat_id=<chat_id>"
+```
+
+The plugin automatically detects Telegram api URLs and formats messages appropriately.
+
 ### Other Notification Services
 
 For other webhook-based notification services, simply provide the webhook URL:
