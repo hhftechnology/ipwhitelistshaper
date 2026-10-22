@@ -52,6 +52,8 @@ Enable the plugin in your Traefik static configuration:
 
 ```yaml
 # Static configuration
+
+[![Discuss on the HHF forum](https://img.shields.io/badge/discuss-forum.hhf.technology-AD1457?logo=discourse&logoColor=white)](https://forum.hhf.technology/c/traefik-plugins-tools/ipwhitelistshaper)
 experimental:
   plugins:
     ipwhitelistshaper:
